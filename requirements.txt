@@ -2,9 +2,10 @@ streamlit
 pandas
 numpy
 scipy>=1.9
-statsmodels
-pingouin
 openpyxl
 xlsxwriter
 matplotlib
-rpy2   # optional; only if you want rank-based ATS via R (nparLD)
+# Optional (advanced models; app still runs without these)
+statsmodels
+pingouin
+rpy2
