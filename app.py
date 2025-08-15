@@ -2,38 +2,33 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
-# ---- Hard dependency guard for Excel (.xlsx) ----
+# ---- Excel engine guard (required for .xlsx) ----
 try:
     import openpyxl  # noqa: F401
 except Exception as e:
-    st.error("This app requires the 'openpyxl' package to read .xlsx files.\n"
-             "Add 'openpyxl' to requirements.txt at the repo root and redeploy.\n\n"
+    st.error("This app needs the 'openpyxl' package to read .xlsx files.\n"
+             "Add it to requirements.txt and redeploy.\n\n"
              f"Import error: {e}")
     st.stop()
 
-from scipy.stats import mannwhitneyu, brunnermunzel, ttest_rel, ttest_ind, wilcoxon, fisher_exact, norm
-import statsmodels.formula.api as smf
-from statsmodels.formula.api import ols
-from statsmodels.stats.anova import anova_lm
-from statsmodels.formula.api import mixedlm
-
-st.set_page_config(page_title="Clinical Analysis Suite v2", layout="wide")
-st.title("Clinical Analysis Suite v2 — Multi-Endpoint • Analysis-Sets • Custom Responders • Weight Modeling")
-
+st.set_page_config(page_title="Clinical Analysis Suite — Full", layout="wide")
+st.title("Clinical Analysis Suite — Full Version")
 st.caption(
-    "Map your columns (Subject, Group, optional Status/Age/Weight/BMI, Baseline, Day28/56/84). "
-    "Choose analysis sets (ITT/PP/Completers/filters), responder rules, and run model-based and nonparam tests. "
-    "Includes: **MMRM Group×Weight** (final-visit effect vs weight) and **maximally-selected weight cut** (permutation-adjusted)."
+    "Upload any endpoint table with Subject/Group and Baseline, Day28, Day56, Day84. "
+    "Map your columns, choose analysis-set filters (ITT/PP/Completers; exclude Dropped AE; Weight/BMI thresholds), "
+    "define custom responder rules, and run parametric/nonparametric analyses. "
+    "Includes MMRM, Group×Weight, maximally-selected weight cut (permutation-adjusted), and Excel export."
 )
 
-DEFAULT_VISITS = ["Day 28", "Day 56", "Day 84"]
-VISIT_KEYS     = ["Day28", "Day56", "Day84"]  # internal keys
+# --------------------- Utilities ---------------------
+def try_numeric(x):
+    return pd.to_numeric(x, errors="coerce")
 
-def norm(s): return str(s).strip().lower()
-def try_numeric(series): return pd.to_numeric(series, errors="coerce")
-def ensure_cat_time(df, order): df["Time"] = pd.Categorical(df["Time"], categories=order, ordered=True); return df
+def ensure_cat_time(df, order):
+    if df.empty: return df
+    df["Time"] = pd.Categorical(df["Time"], categories=order, ordered=True)
+    return df
 
 def safe_pct_improve(baseline, final):
     baseline = np.asarray(baseline, dtype=float)
@@ -43,45 +38,80 @@ def safe_pct_improve(baseline, final):
     out[mask] = (baseline[mask] - final[mask]) / baseline[mask]
     return out
 
-# ---------- Upload ----------
-st.subheader("1) Upload Excel")
-uploaded = st.file_uploader("Upload a workbook with a single endpoint table (Baseline, Day28/56/84).", type=["xlsx"])
-if not uploaded: st.stop()
+def cliffs_delta(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    m, n = len(a), len(b)
+    if m == 0 or n == 0: return np.nan
+    wins = 0
+    for x in a:
+        wins += np.sum(x > b) - np.sum(x < b)
+    return wins / (m * n)
 
-# Use BytesIO for safety on Streamlit Cloud
+def hodges_lehmann(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    if len(a) == 0 or len(b) == 0: return np.nan
+    diffs = a.reshape(-1,1) - b.reshape(1,-1)
+    return float(np.median(diffs))
+
+VISIT_KEYS = ["Day28","Day56","Day84"]
+
+# --------------------- 1) Upload ---------------------
+st.subheader("1) Upload Excel")
+uploaded = st.file_uploader("Upload a workbook (.xlsx)", type=["xlsx"])
+if not uploaded:
+    st.info("Upload a file to begin.")
+    st.stop()
+
 file_bytes = uploaded.read()
 bio = io.BytesIO(file_bytes)
 
-# Sheet and preview
+# Detect sheets and preview
 try:
     xl = pd.ExcelFile(bio, engine="openpyxl")
     sheet_name = st.selectbox("Select sheet", xl.sheet_names, index=0)
-    raw = pd.read_excel(bio, sheet_name=sheet_name, engine="openpyxl")
+    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine="openpyxl")
 except Exception as e:
-    st.error("Failed to read the uploaded .xlsx file with openpyxl. "
-             "Please confirm the file is a valid Excel workbook. "
-             f"Details: {e}")
+    st.error("Failed to read Excel with openpyxl. Ensure it's a valid .xlsx.\n\n" + str(e))
     st.stop()
 
 st.write("Preview:", raw.head())
 
-# ---------- Column mapping ----------
+# --------------------- 2) Map columns ---------------------
 st.subheader("2) Map columns")
 cols = list(raw.columns)
-col_subject = st.selectbox("Subject ID column", cols, index=0)
-col_group   = st.selectbox("Group column", cols, index=1 if len(cols)>1 else 0)
-opt_status  = st.selectbox("Status column (optional)", ["<none>"] + cols, index=0)
-opt_age     = st.selectbox("Age column (optional)", ["<none>"] + cols, index=0)
-opt_weight  = st.selectbox("Weight column (optional)", ["<none>"] + cols, index=0)
-opt_bmi     = st.selectbox("BMI column (optional)", ["<none>"] + cols, index=0)
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    col_subject = st.selectbox("Subject ID column", cols, index=0)
+with c2:
+    col_group   = st.selectbox("Group column", cols, index=min(1,len(cols)-1))
+with c3:
+    col_baseline = st.selectbox("Baseline column", cols, index=min(2,len(cols)-1))
+with c4:
+    endpoint_name = st.text_input("Endpoint name (e.g., IPSS, QOL)", value="IPSS")
 
-col_baseline = st.selectbox("Baseline column", cols, index=min(2, len(cols)-1))
-col_d28      = st.selectbox("Day 28 column", cols, index=min(3, len(cols)-1))
-col_d56      = st.selectbox("Day 56 column", cols, index=min(4, len(cols)-1))
-col_d84      = st.selectbox("Day 84 column", cols, index=min(5, len(cols)-1))
-endpoint_name = st.text_input("Endpoint name", value="IPSS")
+dcols = st.multiselect("Select visit columns (pick Day28, Day56, Day84 equivalents)",
+                       options=cols, default=[c for c in cols if "28" in str(c) or "56" in str(c) or "84" in str(c)][:3])
+# Provide mapping widgets for Day28/Day56/Day84
+def _guess_col(key):
+    for c in cols:
+        s = str(c).lower().replace(" ", "")
+        if key in s: return c
+    return dcols[0] if dcols else cols[min(3,len(cols)-1)]
 
-# Standardize
+col_d28 = st.selectbox("Day 28 column", cols, index=cols.index(_guess_col("day28")) if _guess_col("day28") in cols else min(3,len(cols)-1))
+col_d56 = st.selectbox("Day 56 column", cols, index=cols.index(_guess_col("day56")) if _guess_col("day56") in cols else min(4,len(cols)-1))
+col_d84 = st.selectbox("Day 84 column", cols, index=cols.index(_guess_col("day84")) if _guess_col("day84") in cols else min(5,len(cols)-1))
+
+# Optional meta
+c5, c6, c7 = st.columns(3)
+with c5:
+    col_status = st.selectbox("Status column (optional)", ["<none>"] + cols, index=0)
+with c6:
+    col_weight = st.selectbox("Weight column (optional)", ["<none>"] + cols, index=0)
+with c7:
+    col_bmi    = st.selectbox("BMI column (optional)", ["<none>"] + cols, index=0)
+
+# Build standardized input
 inp = pd.DataFrame({
     "Subject": raw[col_subject],
     "Group": raw[col_group].astype(str).str.strip(),
@@ -90,36 +120,40 @@ inp = pd.DataFrame({
     "Day56": try_numeric(raw[col_d56]),
     "Day84": try_numeric(raw[col_d84]),
 })
-if opt_status != "<none>": inp["Status"] = raw[opt_status].astype(str)
-if opt_age    != "<none>": inp["Age"]    = try_numeric(raw[opt_age])
-if opt_weight != "<none>": inp["Weight"] = try_numeric(raw[opt_weight])
-if opt_bmi    != "<none>": inp["BMI"]    = try_numeric(raw[opt_bmi])
+if col_status != "<none>": inp["Status"] = raw[col_status].astype(str)
+if col_weight != "<none>": inp["Weight"] = try_numeric(raw[col_weight])
+if col_bmi    != "<none>": inp["BMI"]    = try_numeric(raw[col_bmi])
 
 # Long change + raw
 rows = []
 for _, r in inp.iterrows():
-    for v in ["Day28","Day56","Day84"]:
+    for v in VISIT_KEYS:
         if pd.notna(r[v]):
             rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(r[v]-r["Baseline"])})
-long_change = ensure_cat_time(pd.DataFrame(rows), ["Day28","Day56","Day84"]) if len(rows)>0 else pd.DataFrame()
+long_change = pd.DataFrame(rows)
+long_change = ensure_cat_time(long_change, VISIT_KEYS) if not long_change.empty else long_change
 
 rows_raw = []
 for _, r in inp.iterrows():
-    for v in ["Day28","Day56","Day84"]:
+    for v in VISIT_KEYS:
         if pd.notna(r[v]):
             rows_raw.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v,
                              endpoint_name: float(r[v]), "Baseline": float(r["Baseline"]),
                              "Weight": r.get("Weight", np.nan)})
-long_raw = ensure_cat_time(pd.DataFrame(rows_raw), ["Day28","Day56","Day84"]) if len(rows_raw)>0 else pd.DataFrame()
+long_raw = pd.DataFrame(rows_raw)
+long_raw = ensure_cat_time(long_raw, VISIT_KEYS) if not long_raw.empty else long_raw
 
-# ---------- Analysis sets & filters ----------
-st.subheader("3) Analysis sets & filters")
+st.subheader("Mapped data (head)")
+st.dataframe(inp.head())
+
+# --------------------- 3) Analysis-set & filters ---------------------
+st.subheader("3) Analysis set & filters")
 c1, c2, c3, c4, c5 = st.columns(5)
-with c1: use_itt = st.checkbox("ITT/mITT", value=True)
-with c2: use_pp = st.checkbox("PP (Status==ACTIVE)", value=False)
+with c1: use_itt = st.checkbox("ITT/mITT (default)", value=True)
+with c2: use_pp = st.checkbox("PP (Status == ACTIVE)", value=False)
 with c3: use_completers = st.checkbox("Completers (has Day84)", value=False)
 with c4: excl_dae = st.checkbox("Exclude 'Dropped AE'", value=False)
-with c5: custom_pair = st.checkbox("Custom pair", value=True)
+with c5: custom_pair = st.checkbox("Custom pair (choose groups)", value=True)
 
 c6, c7 = st.columns(2)
 with c6:
@@ -129,12 +163,11 @@ with c7:
     b_thr_on = st.checkbox("Filter: BMI < threshold", value=False)
     b_thr = st.number_input("BMI threshold", value=35.0, step=0.5)
 
-# Pair groups
 groups_all = sorted(inp["Group"].dropna().unique().tolist())
 if custom_pair and len(groups_all) >= 2:
-    colA, colB = st.columns(2)
-    with colA: gA = st.selectbox("Group A", groups_all, index=0)
-    with colB: gB = st.selectbox("Group B", groups_all, index=1)
+    cpa, cpb = st.columns(2)
+    with cpa: gA = st.selectbox("Group A", groups_all, index=0)
+    with cpb: gB = st.selectbox("Group B", groups_all, index=1)
 else:
     gA, gB = (groups_all[0], groups_all[1]) if len(groups_all)>=2 else (None, None)
 
@@ -145,39 +178,46 @@ if excl_dae and ("Status" in inp.columns):
     keep.loc[bad] = False
 if use_pp and ("Status" in inp.columns):
     keep &= (inp["Status"].astype(str).str.upper() == "ACTIVE")
-if use_completers: keep &= inp["Day84"].notna()
-if w_thr_on and ("Weight" in inp.columns): keep &= (inp["Weight"] < w_thr)
-if b_thr_on and ("BMI" in inp.columns): keep &= (inp["BMI"] < b_thr)
+if use_completers:
+    keep &= inp["Day84"].notna()
+if w_thr_on and ("Weight" in inp.columns):
+    keep &= (inp["Weight"] < w_thr)
+if b_thr_on and ("BMI" in inp.columns):
+    keep &= (inp["BMI"] < b_thr)
 
 keep_ids = set(inp["Subject"][keep])
 inp_f = inp[inp["Subject"].isin(keep_ids)].copy()
 lc_f  = long_change[long_change["Subject"].isin(keep_ids)].copy()
 lr_f  = long_raw[long_raw["Subject"].isin(keep_ids)].copy()
-
 st.write(f"Kept N subjects: {len(keep_ids)}")
 
-# ---------- RM (rank ANOVA) ----------
-st.subheader("4) Repeated measures (rank ANOVA on change)")
+# --------------------- 4) RM across groups ---------------------
+st.subheader("4) Repeated measures across ALL groups (rank-based ANOVA)")
+rm_df = pd.DataFrame({"Effect":["Group (all groups)", "Time", "Group × Time"], "p-value":[np.nan,np.nan,np.nan]})
 if not lc_f.empty:
-    lc = lc_f.copy(); lc["rank_change"] = lc["Change"].rank(method="average")
+    # Lazy import heavy stats on-demand
+    import statsmodels.formula.api as smf
+    from statsmodels.formula.api import ols
+    from statsmodels.stats.anova import anova_lm
+    lc = lc_f.copy()
+    lc["rank_change"] = lc["Change"].rank(method="average")
     model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
     an = anova_lm(model, typ=3)
     rm_df = pd.DataFrame({
-        "Effect": ["Group (all groups)", "Time (Day28, Day56, Day84)", "Group × Time"],
+        "Effect": ["Group (all groups)", f"Time ({', '.join(VISIT_KEYS)})", "Group × Time"],
         "p-value": [float(an.loc["C(Group)","PR(>F)"]),
                     float(an.loc["C(Time)","PR(>F)"]),
                     float(an.loc["C(Group):C(Time)","PR(>F)"])]
     })
-else:
-    rm_df = pd.DataFrame({"Effect":["Group (all groups)", "Time", "Group × Time"], "p-value":[np.nan,np.nan,np.nan]})
 st.dataframe(rm_df)
 
-# ---------- Pairwise per visit ----------
+# --------------------- 5) Pairwise per-visit ---------------------
 st.subheader("5) Pairwise tests per visit")
 pair_df = pd.DataFrame()
 if gA and gB and not lc_f.empty:
+    from scipy.stats import mannwhitneyu, brunnermunzel, ttest_ind
     rows = []
-    for v in ["Day28","Day56","Day84"]:
+    for v in VISIT_KEYS:
         a = lc_f[(lc_f["Group"]==gA) & (lc_f["Time"]==v)]["Change"].dropna()
         b = lc_f[(lc_f["Group"]==gB) & (lc_f["Time"]==v)]["Change"].dropna()
         if len(a)>0 and len(b)>0:
@@ -196,14 +236,15 @@ if gA and gB and not lc_f.empty:
     pair_df = pd.DataFrame(rows)
 st.dataframe(pair_df)
 
-# ---------- Within-group ----------
-st.subheader("6) Within-group change tests")
+# --------------------- 6) Within-group ---------------------
+st.subheader("6) Within-group change tests (Baseline → each visit)")
 within_rows = []
 if not inp_f.empty:
+    from scipy.stats import wilcoxon, ttest_rel
     for grp in sorted(inp_f["Group"].unique().tolist()):
         g = inp_f[inp_f["Group"]==grp]
         base = g["Baseline"]
-        for v in ["Day28","Day56","Day84"]:
+        for v in VISIT_KEYS:
             fol = g[v]
             paired = pd.concat([base, fol], axis=1).dropna()
             if paired.shape[0]>0:
@@ -219,61 +260,75 @@ if not inp_f.empty:
 within_df = pd.DataFrame(within_rows)
 st.dataframe(within_df)
 
-# ---------- End-of-trial (ANCOVA & MMRM) ----------
-st.subheader("7) End-of-trial (final visit) — model-based p-values")
+# --------------------- 7) End-of-trial models ---------------------
+st.subheader("7) End-of-trial (Day-84) — model-based")
 final_key = "Day84"
-anc_row = {"Method":"ANCOVA Δ(final)","p-value":np.nan}
+from scipy.stats import norm as _norm
+
+anc_p = np.nan
 if not inp_f.empty and final_key in inp_f.columns:
+    import statsmodels.formula.api as smf
     use = inp_f[["Subject","Group","Baseline",final_key]].dropna().copy()
     if use["Group"].nunique() >= 2:
         use["chg"] = use[final_key] - use["Baseline"]
         use["Group_bin"] = (use["Group"].astype(str).str.strip() != "Placebo").astype(int)
-        m = smf.ols("chg ~ Group_bin + Baseline", data=use).fit(cov_type="HC3")
-        anc_row["p-value"] = float(m.pvalues.get("Group_bin", np.nan))
-mmrm_row = {"Method":"MMRM Day-84 contrast","p-value":np.nan}
+        mod = smf.ols("chg ~ Group_bin + Baseline", data=use).fit(cov_type="HC3")
+        anc_p = float(mod.pvalues.get("Group_bin", np.nan))
+
+mmrm_p = np.nan
 if not lr_f.empty:
-    lr = lr_f.dropna(subset=[endpoint_name,"Group","Time","Baseline"]).copy()
-    if not lr.empty:
-        lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
-        lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
-        try:
-            model = mixedlm(f"{endpoint_name} ~ BL_centered + C(Time) + Group_bin + Group_bin:C(Time)",
-                            lr, groups=lr["Subject"], re_formula="1").fit(method="lbfgs")
-            names = model.model.exog_names
-            coef = model.params.get("Group_bin", 0.0) + model.params.get("Group_bin:C(Time)[T.Day84]", 0.0)
-            cvec = np.zeros(len(names))
+    try:
+        import statsmodels.formula.api as smf
+        from statsmodels.formula.api import mixedlm
+        lr = lr_f.dropna(subset=[endpoint_name,"Group","Time","Baseline"]).copy()
+        if not lr.empty:
+            lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
+            lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
+            m = mixedlm(f"{endpoint_name} ~ BL_centered + C(Time) + Group_bin + Group_bin:C(Time)",
+                        lr, groups=lr["Subject"], re_formula="1").fit(method="lbfgs")
+            names = m.model.exog_names
+            coef = m.params.get("Group_bin", 0.0) + m.params.get("Group_bin:C(Time)[T.Day84]", 0.0)
+            import numpy as _np
+            cvec = _np.zeros(len(names))
             if "Group_bin" in names: cvec[names.index("Group_bin")] = 1.0
             if "Group_bin:C(Time)[T.Day84]" in names: cvec[names.index("Group_bin:C(Time)[T.Day84]")] = 1.0
-            cov = model.cov_params().loc[names, names].values
-            se = float(np.sqrt(cvec @ cov @ cvec.T))
+            cov = m.cov_params().loc[names, names].values
+            se = float((_np.sqrt(cvec @ cov @ cvec.T)))
             z = coef / se if se != 0 else np.nan
-            mmrm_row["p-value"] = float(2*(1-norm.cdf(abs(z)))) if z==z else np.nan
-        except Exception as e:
-            st.warning(f"MMRM fit failed: {e}")
-final_model_df = pd.DataFrame([anc_row, mmrm_row])
+            mmrm_p = float(2*(1-_norm.cdf(abs(z)))) if z==z else np.nan
+    except Exception as e:
+        st.warning(f"MMRM failed: {e}")
+
+final_model_df = pd.DataFrame([
+    {"Method":"ANCOVA Δ(final)", "p-value": anc_p},
+    {"Method":"MMRM Day-84 contrast", "p-value": mmrm_p},
+])
 st.dataframe(final_model_df)
 
-# ---------- MMRM Group×Weight ----------
-st.subheader("8) MMRM with Group×Weight — final visit effect vs weight")
+# --------------------- 8) MMRM Group×Weight ---------------------
+st.subheader("8) MMRM with Group×Weight — Day-84 effect vs weight")
 run_gxw = st.checkbox("Run Group×Weight model and plot Day-84 effect vs weight", value=False)
 gxw_df = pd.DataFrame()
 if run_gxw and ("Weight" in lr_f.columns) and not lr_f["Weight"].isna().all():
-    lr = lr_f.dropna(subset=[endpoint_name, "Group", "Time", "Baseline", "Weight"]).copy()
-    lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
-    lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
-    lr["Weight_c"]    = lr["Weight"] - lr["Weight"].mean()
     try:
-        model = mixedlm(f"{endpoint_name} ~ BL_centered + C(Time) + Group_bin + Weight_c + Group_bin:Weight_c + Group_bin:C(Time)",
-                        lr, groups=lr["Subject"], re_formula="1").fit(method="lbfgs")
-        names = model.model.exog_names; params = model.params[names]; cov = model.cov_params().loc[names, names].values
+        import matplotlib.pyplot as plt
+        import statsmodels.formula.api as smf
+        from statsmodels.formula.api import mixedlm
+        lr = lr_f.dropna(subset=[endpoint_name,"Group","Time","Baseline","Weight"]).copy()
+        lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
+        lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
+        lr["Weight_c"]    = lr["Weight"] - lr["Weight"].mean()
+        m = mixedlm(f"{endpoint_name} ~ BL_centered + C(Time) + Group_bin + Weight_c + Group_bin:Weight_c + Group_bin:C(Time)",
+                    lr, groups=lr["Subject"], re_formula="1").fit(method="lbfgs")
+        names = m.model.exog_names; params = m.params[names]; cov = m.cov_params().loc[names, names].values
         weights = np.linspace(lr["Weight"].min(), lr["Weight"].max(), 100)
         rows = []
         for w in weights:
             wc = w - lr["Weight"].mean()
             cvec = np.zeros(len(names))
             if "Group_bin" in names: cvec[names.index("Group_bin")] = 1.0
-            key84 = "Group_bin:C(Time)[T.Day84]"
-            if key84 in names: cvec[names.index(key84)] = 1.0
+            k84 = "Group_bin:C(Time)[T.Day84]"
+            if k84 in names: cvec[names.index(k84)] = 1.0
             if "Group_bin:Weight_c" in names: cvec[names.index("Group_bin:Weight_c")] = wc
             diff = float(cvec @ params.values); se = float(np.sqrt(cvec @ cov @ cvec.T))
             rows.append({"Weight": w, "Effect (USPlus−Placebo)": diff, "LCL": diff-1.96*se, "UCL": diff+1.96*se})
@@ -284,14 +339,15 @@ if run_gxw and ("Weight" in lr_f.columns) and not lr_f["Weight"].isna().all():
         ax.axhline(0, linestyle="--")
         ax.set_title(f"{endpoint_name}: Day-84 effect vs Weight (negative favors USPlus)")
         ax.set_xlabel("Weight (kg)"); ax.set_ylabel("Effect (USPlus − Placebo)")
-        st.pyplot(fig); st.dataframe(gxw_df.round(3))
+        st.pyplot(fig)
+        st.dataframe(gxw_df.round(3))
     except Exception as e:
         st.warning(f"Group×Weight model could not be fit: {e}")
 else:
-    st.caption("Toggle the checkbox to run; requires a Weight column.")
+    st.caption("Toggle the checkbox to run; requires Weight column in the sheet.")
 
-# ---------- Maximally selected cut ----------
-st.subheader("9) Maximally-selected weight threshold (ΔDay84 ANCOVA)")
+# --------------------- 9) Maximally-selected weight cut ---------------------
+st.subheader("9) Maximally-selected weight threshold (ANCOVA on ΔDay84)")
 run_cut = st.checkbox("Run threshold finder with permutation-adjusted p-value", value=False)
 perm_N = st.number_input("Permutations", value=200, min_value=50, max_value=2000, step=50)
 cut_low_pct  = st.slider("Search lower percentile of weight", 0, 40, 10)
@@ -299,8 +355,9 @@ cut_high_pct = st.slider("Search upper percentile of weight", 60, 100, 90)
 cut_results = {}; cut_table = pd.DataFrame()
 
 if run_cut and not inp_f.empty and "Weight" in inp_f.columns:
+    import statsmodels.formula.api as smf
     w = inp_f["Weight"].dropna().to_numpy()
-    if w.size >= 10:
+    if w.size >= 10 and "Day84" in inp_f.columns:
         lo = np.percentile(w, cut_low_pct); hi = np.percentile(w, cut_high_pct)
         candidates = np.unique(np.round(np.linspace(lo, hi, 25), 2))
         rows = []
@@ -346,38 +403,64 @@ if run_cut and not inp_f.empty and "Weight" in inp_f.columns:
 else:
     st.caption("Toggle the checkbox to run; requires Weight and Day84.")
 
-# ---------- Responders ----------
+# --------------------- 10) Responders ---------------------
 st.subheader("10) Responders at final visit (custom rules)")
-colR1, colR2, colR3 = st.columns(3)
-with colR1: thr_points = st.number_input("Absolute improvement ≥ (points)", value=5, step=1)
-with colR2: thr_pct = st.number_input("Percent improvement ≥ (%)", value=25, step=5) / 100.0
-with colR3: dir_lower_better = st.selectbox("Direction (lower score = better?)", ["Yes","No"], index=0) == "Yes"
+cR1, cR2, cR3 = st.columns(3)
+with cR1: thr_points = st.number_input("Absolute improvement ≥ (points)", value=5, step=1)
+with cR2: thr_pct = st.number_input("Percent improvement ≥ (%)", value=25, step=5) / 100.0
+with cR3: dir_lower_better = st.selectbox("Direction (lower score = better?)", ["Yes","No"], index=0) == "Yes"
 
+from scipy.stats import fisher_exact
 resp_rows = []
 if not inp_f.empty and "Day84" in inp_f.columns:
     use = inp_f[["Subject","Group","Baseline","Day84"]].dropna().copy()
     if use["Group"].nunique() >= 2:
         if dir_lower_better:
-            use["chg"] = use["Day84"] - use["Baseline"]
+            use["chg"] = use["Day84"] - use["Baseline"]   # negative is improvement
             abs_resp = (use["chg"] <= -thr_points).astype(int)
             pct_resp = (safe_pct_improve(use["Baseline"], use["Day84"]) >= thr_pct).astype(int)
         else:
-            use["chg"] = use["Day84"] - use["Baseline"]
+            use["chg"] = use["Day84"] - use["Baseline"]   # positive is improvement
             abs_resp = (use["chg"] >= thr_points).astype(int)
             pct_resp = (((use["Day84"] - use["Baseline"]) / use["Baseline"]) >= thr_pct).astype(int)
         for label, resp in [(f"≥{thr_points} points", abs_resp),
                             (f"≥{int(thr_pct*100)}%", pct_resp)]:
             tab = pd.crosstab((use["Group"].astype(str).str.strip()!="Placebo"), resp)
             if tab.shape == (2,2):
-                OR, p = fisher_exact(tab.values, alternative="greater")
+                OR, p = fisher_exact(tab.values, alternative="greater")  # USPlus better
                 resp_rows.append({"Endpoint":label, "Odds Ratio":float(OR), "p-value (1-sided)":float(p)})
             else:
                 resp_rows.append({"Endpoint":label, "Odds Ratio":np.nan, "p-value (1-sided)":np.nan})
 resp_df = pd.DataFrame(resp_rows)
 st.dataframe(resp_df)
 
-# ---------- Export ----------
-st.subheader("11) Download Excel with all results")
+# --------------------- 11) Chart (optional) ---------------------
+st.subheader("11) Chart (median Δ with IQR) for selected pair")
+if gA and gB and not lc_f.empty:
+    import matplotlib.pyplot as plt
+    dfp = lc_f.copy()
+    fig, ax = plt.subplots()
+    for grp in [gA, gB]:
+        med = []; lo=[]; hi=[]
+        for v in VISIT_KEYS:
+            x = dfp[(dfp["Group"]==grp) & (dfp["Time"]==v)]["Change"].dropna().to_numpy()
+            if x.size == 0:
+                med.append(np.nan); lo.append(np.nan); hi.append(np.nan)
+            else:
+                m = np.median(x); q1 = np.percentile(x,25); q3 = np.percentile(x,75)
+                med.append(m); lo.append(m-(m-q1)); hi.append(m+(q3-m))
+        xs = np.arange(len(VISIT_KEYS))
+        ax.plot(xs, med, marker="o", label=f"{grp} (median Δ)")
+        ax.fill_between(xs, lo, hi, alpha=0.3)
+    ax.set_xticks(np.arange(len(VISIT_KEYS)), VISIT_KEYS)
+    ax.set_xlabel("Visit"); ax.set_ylabel("Change from Baseline")
+    ax.set_title(f"{endpoint_name}: Median Change with IQR — {gA} vs {gB}")
+    ax.legend(); st.pyplot(fig)
+else:
+    st.info("Select two groups and ensure data exists for chart.")
+
+# --------------------- 12) Download Excel ---------------------
+st.subheader("12) Download full results workbook")
 out = io.BytesIO()
 with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
     inp_f.to_excel(writer, sheet_name="INPUT_FILTERED", index=False)
@@ -394,10 +477,7 @@ with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
 out.seek(0)
 base = uploaded.name.rsplit(".",1)[0]
 st.download_button(
-    "⬇️ Download results workbook",
+    "⬇️ Download results Excel",
     data=out,
-    file_name=f"{base}_{endpoint_name}_RESULTS_v2.xlsx",
+    file_name=f"{base}_{endpoint_name}_FULL_RESULTS.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-  
