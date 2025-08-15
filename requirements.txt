@@ -7,4 +7,4 @@ pingouin
 openpyxl
 xlsxwriter
 matplotlib
-rpy2   # optional; only if you want the rank-based ATS via R (nparLD)
+rpy2   # optional; only if you want rank-based ATS via R (nparLD)
