@@ -3,7 +3,7 @@ IPSS (4 Time Points) — Between-Group Longitudinal Suite
 
 Upload an Excel with:
   - 'SUBJECT ID'
-  - 'GROUP' (maps robustly: Placebo vs USPlus; aliases like "US Plus"/"Active" -> USPlus)
+  - 'GROUP' (robust mapping: Placebo vs USPlus; aliases like "US Plus"/"Active" -> USPlus)
   - Four columns of the SAME IPSS scale across time (Baseline, Day 28, Day 56, Day 84),
     e.g. "Baseline IPSS  Total Score", "Day 28 IPSS  Total Score", ...
 
@@ -93,6 +93,10 @@ def normalize_groups(series: pd.Series) -> pd.Series:
 def make_long(df: pd.DataFrame, ipss_cols: List[str]) -> pd.DataFrame:
     long = df.copy()
     long["GROUP_NORM"] = normalize_groups(long["GROUP"])
+    # warn & filter
+    bad = long.loc[long["GROUP_NORM"].isna(), "GROUP"].dropna().astype(str).unique()
+    if len(bad):
+        st.warning(f"Dropped rows with unrecognized GROUP labels: {', '.join(sorted(bad))[:300]}")
     long = long.loc[long["GROUP_NORM"].isin(["Placebo", "USPlus"])].copy()
     long = long.dropna(subset=[ipss_cols[0]])  # need Baseline for covariate
     long = long[["SUBJECT ID", "GROUP_NORM"] + ipss_cols].copy()
@@ -218,7 +222,13 @@ def mixed_or_rm_anova(df_long: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     try:
         from statsmodels.stats.anova import AnovaRM
         aov = AnovaRM(use, depvar="Score", subject="SUBJECT ID", within=["Time"]).fit()
-        out["RM_ANOVA_SM_WITHIN_ONLY"] = aov.anova_table  # pandas DataFrame
+        # aov.summary() is a SimpleTable; use its dataframe where available:
+        try:
+            out["RM_ANOVA_SM_WITHIN_ONLY"] = aov.anova_table
+        except Exception:
+            # very old statsmodels; fallback to HTML parse
+            import pandas as _pd
+            out["RM_ANOVA_SM_WITHIN_ONLY"] = _pd.read_html(aov.summary().tables[0].as_html(), header=0, index_col=0)[0]
     except Exception:
         pass
     return out
@@ -233,7 +243,8 @@ def manova(df_long: pd.DataFrame, ipss_cols: List[str]) -> pd.DataFrame:
     if sub.empty or len(have) < 2:
         return _table_or_empty(["Test", "Statistic", "df1", "df2", "p-value"], [])
     try:
-        formula = " + ".join([f\"Q('{c}')\" for c in have]) + " ~ C(GROUP_NORM)"
+        # FIXED: no stray escapes; this was causing your SyntaxError
+        formula = " + ".join([f"Q('{c}')" for c in have]) + " ~ C(GROUP_NORM)"
         mv = sm.multivariate.MANOVA.from_formula(formula, data=sub)
         w = mv.mv_test()
         test_tbl = w.results['C(GROUP_NORM)']['stat']
@@ -372,8 +383,9 @@ def _fig_to_buf(fig) -> io.BytesIO:
 def draw_boxplots(df_long: pd.DataFrame, ipss_cols: List[str]) -> List[Tuple[str, io.BytesIO]]:
     figs = []
     for col in ipss_cols:
-        pl = (df_long[df_long["Time"]==col].loc[df_long["GROUP_NORM"]=="Placebo","Score"]).dropna()
-        us = (df_long[df_long["Time"]==col].loc[df_long["GROUP_NORM"]=="USPlus","Score"]).dropna()
+        sub = df_long[df_long["Time"] == col]
+        pl = sub.loc[sub["GROUP_NORM"]=="Placebo", "Score"].dropna()
+        us = sub.loc[sub["GROUP_NORM"]=="USPlus",   "Score"].dropna()
         if len(pl)==0 and len(us)==0: continue
         fig, ax = plt.subplots()
         ax.boxplot([pl.values, us.values], labels=["Placebo","USPlus"])
