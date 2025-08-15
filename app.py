@@ -1,26 +1,23 @@
 """
 Streamlit app: Upload an IPSS Excel file (4 time points) and compute
-parametric & non-parametric stats for within-/between-group analyses.
-Adds **end-of-trial focus**, **RM/Mixed ANOVA summary**, **effect sizes**,
-**charts on screen**, and **charts embedded in the Excel download**.
+parametric & non-parametric p-values within & between groups.
+NOW ADDS: Δ-by-visit tests AND a Van Elteren test (stratified Wilcoxon)
+that pools **change-from-baseline** across post-baseline visits
+(typically Day 28, 56, 84) into a single between-group p-value.
 
-Deploy notes (Streamlit Cloud)
-- Python >=3.9
-- requirements.txt
+Requirements (requirements.txt)
   streamlit
   pandas
-  scipy>=1.9
+  scipy
   numpy
   openpyxl
   xlsxwriter
   matplotlib
-  statsmodels
-  pingouin
 
-Expected columns in Excel (case-sensitive):
+Template columns (case-sensitive):
 - SUBJECT ID
-- GROUP  (exact 'Placebo' treated as Placebo; everything else is Active)
-- 4 timepoint columns for the *same* IPSS scale, e.g.
+- GROUP  (exact 'Placebo' treated as Placebo; everything else → Active)
+- Four timepoint columns of the same IPSS scale, e.g.
   Baseline IPSS  Total Score, Day 28 IPSS  Total Score,
   Day 56 IPSS  Total Score, Day 84 IPSS  Total Score
 """
@@ -35,9 +32,9 @@ import pandas as pd
 import scipy.stats as stats
 import streamlit as st
 
-st.set_page_config(page_title="IPSS P-Values (4 TP) — v4", layout="wide")
-st.title("IPSS (4 Time Points) — Stats, RM ANOVA & Excel Charts (v4)")
-st.caption("Upload your Excel, see end-of-trial results, within/ between-group tests, mixed ANOVA, effect sizes, and download a results workbook WITH charts.")
+st.set_page_config(page_title="IPSS P-Values (4 Time Points)", layout="wide")
+st.title("IPSS (4 Time Points): P-Values Explorer — Van Elteren Enabled")
+st.caption("Upload your Excel. The app computes within-/between-group tests, Δ-by-visit non-parametric p-values, and a pooled Van Elteren p-value.")
 
 # -------------------------------
 # Utilities
@@ -48,7 +45,10 @@ REQUIRED_ID_COLS = ["SUBJECT ID", "GROUP"]
 
 
 def find_ipss_columns(columns: List[str]) -> List[str]:
-    cand = [c for c in columns if IPSS_COL_REGEX.search(str(c))]
+    cand = []
+    for c in columns:
+        if IPSS_COL_REGEX.search(str(c)):
+            cand.append(c)
     def time_key(col: str) -> int:
         s = col.lower()
         for k, v in TIME_ORDER_MAP.items():
@@ -64,7 +64,7 @@ def validate_template(df: pd.DataFrame) -> Tuple[bool, str, List[str]]:
         return False, f"Missing required columns: {missing_ids}", []
     ipss_cols = find_ipss_columns(df.columns.tolist())
     if len(ipss_cols) != 4:
-        return False, "Need exactly 4 timepoint columns (Baseline/Day28/Day56/Day84 IPSS  Total Score).", ipss_cols
+        return False, "Could not detect exactly 4 IPSS timepoint columns (Baseline/Day 28/Day 56/Day 84 IPSS  Total Score).", ipss_cols
     return True, "", ipss_cols
 
 
@@ -72,64 +72,72 @@ def label_groups(series: pd.Series) -> pd.Series:
     return np.where(series.astype(str).str.strip().str.lower() == "placebo", "Placebo", "Active")
 
 
-# ---------- Non-parametrics beyond p-values ----------
+# -------------------------------
+# Van Elteren (stratified Wilcoxon) on Δ across visits
+# -------------------------------
 
-def cliffs_delta(x: np.ndarray, y: np.ndarray) -> Optional[float]:
-    x = np.asarray(x); y = np.asarray(y)
-    if x.size == 0 or y.size == 0:
-        return None
-    diffs = x[:, None] - y[None, :]
-    num = (diffs > 0).sum() - (diffs < 0).sum()
-    return float(num) / float(x.size * y.size)
+def _wilcoxon_stratum_stats(active: np.ndarray, placebo: np.ndarray) -> Tuple[float, float, float]:
+    """Return (W, E, Var) for Wilcoxon rank-sum within one stratum with tie correction.
+    W is sum of ranks for Active using average ranks.
+    """
+    x = np.asarray(active, dtype=float)
+    y = np.asarray(placebo, dtype=float)
+    n1, n2 = x.size, y.size
+    N = n1 + n2
+    pooled = np.concatenate([x, y])
+    ranks = stats.rankdata(pooled, method="average")
+    W = ranks[:n1].sum()
+    # Expected value under H0
+    E = n1 * (N + 1) / 2.0
+    # Tie correction term
+    # counts of equal values in pooled
+    vals, counts = np.unique(pooled, return_counts=True)
+    tie_term = ((counts ** 3 - counts).sum()) / (N * (N - 1)) if N > 1 else 0.0
+    Var = (n1 * n2 / 12.0) * ((N + 1) - tie_term)
+    return float(W), float(E), float(Var)
 
 
-def rank_biserial_from_u(u: float, n1: int, n2: int, sign_hint: float) -> Optional[float]:
-    if n1 * n2 == 0:
-        return None
-    r = 1.0 - 2.0 * (u / (n1 * n2))
-    return float(np.sign(sign_hint)) * abs(float(r)) if sign_hint != 0 else float(r)
-
-
-def common_language_effect(x: np.ndarray, y: np.ndarray) -> Optional[float]:
-    x = np.asarray(x); y = np.asarray(y)
-    if x.size == 0 or y.size == 0:
-        return None
-    diffs = x[:, None] - y[None, :]
-    return float((diffs > 0).sum() / (x.size * y.size))
-
-
-def hl_shift_and_ci(x: np.ndarray, y: np.ndarray, n_boot: int = 2000, seed: int = 7) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    x = np.asarray(x); y = np.asarray(y)
-    if x.size < 2 or y.size < 2:
-        return None, None, None
-    try:
-        hl = float(stats.hodgeslehmann(x, y))
-    except Exception:
-        hl = float(np.median(x) - np.median(y))
-    rng = np.random.default_rng(seed)
-    boots = []
-    for _ in range(n_boot):
-        xb = rng.choice(x, size=x.size, replace=True)
-        yb = rng.choice(y, size=y.size, replace=True)
-        try:
-            boots.append(float(stats.hodgeslehmann(xb, yb)))
-        except Exception:
-            boots.append(float(np.median(xb) - np.median(yb)))
-    lo, hi = np.percentile(boots, [2.5, 97.5])
-    return hl, float(lo), float(hi)
+def van_elteren_delta(active_by_visit: Dict[str, np.ndarray], placebo_by_visit: Dict[str, np.ndarray]) -> Tuple[Optional[float], Optional[float], List[Tuple[str, int, int]]]:
+    """Compute Van Elteren Z and two-sided p-value across visits using Δs.
+    Returns (Z, p, strata_counts_list[ (visit, n_placebo, n_active), ... ]).
+    Skips strata with <1 obs in either arm. If all skipped or Var_sum=0 -> (None, None, counts).
+    """
+    W_sum = 0.0
+    E_sum = 0.0
+    Var_sum = 0.0
+    counts = []
+    for visit in sorted(active_by_visit.keys(), key=lambda s: TIME_ORDER_MAP.get(s.lower(), 9999)):
+        ax = np.asarray(active_by_visit[visit])
+        px = np.asarray(placebo_by_visit.get(visit, np.array([])))
+        n1, n2 = ax.size, px.size
+        if n1 < 1 or n2 < 1:
+            continue
+        W, E, Var = _wilcoxon_stratum_stats(ax, px)
+        W_sum += W
+        E_sum += E
+        Var_sum += Var
+        counts.append((visit, int(n2), int(n1)))  # (visit, N Placebo, N Active)
+    if Var_sum <= 0 or len(counts) == 0:
+        return None, None, counts
+    Z = (W_sum - E_sum) / np.sqrt(Var_sum)
+    p = 2.0 * (1.0 - stats.norm.cdf(abs(Z)))
+    return float(Z), float(p), counts
 
 
 @st.cache_data(show_spinner=False)
 def compute_p_values(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, pd.DataFrame]:
-    """Compute within (paired) + between (timepoint & Δ) parametric and non-parametric tests,
-    plus non-p-value effect sizes suitable for skewed data. Also returns end-of-trial summary.
+    """Compute:
+    - WITHIN-GROUP (paired): Paired t-test, Wilcoxon (All, Placebo, Active)
+    - BETWEEN-GROUP at each timepoint: Welch t, Mann–Whitney U
+    - BETWEEN-GROUP on Δ by visit: Welch t, Mann–Whitney U
+    - Van Elteren on Δ across visits: one pooled p-value accounting for visit strata
     """
     work = df.copy()
     work["GROUP_NORM"] = label_groups(work["GROUP"])  # Placebo vs Active
 
-    # WITHIN (paired)
+    # ---------- WITHIN-GROUP (paired) ----------
     within_ready = work.dropna(subset=ipss_cols)
-    within_rows = []
+    within_records = []
     for g in ("All", "Placebo", "Active"):
         dsub = within_ready if g == "All" else within_ready[within_ready["GROUP_NORM"] == g]
         if len(dsub) < 3:
@@ -145,248 +153,122 @@ def compute_p_values(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, pd.Dat
                     _, p_w = stats.wilcoxon(dsub[a], dsub[b], zero_method='wilcox', alternative='two-sided', mode='auto')
                 except Exception:
                     p_w = np.nan
-                within_rows.append([g, a, b, "Paired t-test", p_t])
-                within_rows.append([g, a, b, "Wilcoxon signed-rank", p_w])
-    within_df = pd.DataFrame(within_rows, columns=["Group", "Time A", "Time B", "Test", "p-value"]) if within_rows else pd.DataFrame(columns=["Group", "Time A", "Time B", "Test", "p-value"])            
+                within_records.append([g, a, b, "Paired t-test", p_t])
+                within_records.append([g, a, b, "Wilcoxon signed-rank", p_w])
+    within_df = pd.DataFrame(within_records, columns=["Group", "Time A", "Time B", "Test", "p-value"]) if within_records else pd.DataFrame(columns=["Group", "Time A", "Time B", "Test", "p-value"])            
 
-    # BETWEEN at each timepoint + effect sizes
-    bt_rows = []
-    eff_rows = []
+    # ---------- BETWEEN-GROUP at each timepoint ----------
+    between_rows = []
     for col in ipss_cols:
-        pl = work.loc[work["GROUP_NORM"] == "Placebo", col].dropna().to_numpy()
-        ac = work.loc[work["GROUP_NORM"] == "Active",  col].dropna().to_numpy()
-        n_p, n_a = pl.size, ac.size
-        note = None
-        if n_p >= 2 and n_a >= 2:
+        placebo = work.loc[work["GROUP_NORM"] == "Placebo", col].dropna()
+        active  = work.loc[work["GROUP_NORM"] == "Active",  col].dropna()
+        if len(placebo) >= 2 and len(active) >= 2:
             try:
-                _, p_t = stats.ttest_ind(pl, ac, equal_var=False, nan_policy='omit')
+                _, p_t = stats.ttest_ind(placebo, active, equal_var=False, nan_policy='omit')
             except Exception:
                 p_t = np.nan
             try:
-                u_stat, p_u = stats.mannwhitneyu(pl, ac, alternative='two-sided')
+                _, p_u = stats.mannwhitneyu(placebo, active, alternative='two-sided')
             except Exception:
-                u_stat, p_u = np.nan, np.nan
-            try:
-                _, p_bm = stats.brunnermunzel(pl, ac, alternative='two-sided')
-            except Exception:
-                p_bm = np.nan
-            cd = cliffs_delta(ac, pl)  # positive if Active > Placebo
-            sign_hint = float(np.median(ac) - np.median(pl))
-            r_rb = rank_biserial_from_u(u_stat if not isinstance(u_stat, float) or not np.isnan(u_stat) else 0.5*n_p*n_a, n_a, n_p, sign_hint)
-            cles = common_language_effect(ac, pl)  # P(Active > Placebo)
-            hl, lo, hi = hl_shift_and_ci(ac, pl)
-        else:
-            p_t = p_u = p_bm = np.nan
-            cd = r_rb = cles = hl = lo = hi = None
-            note = "Insufficient N in one or both groups"
-        bt_rows.append([col, n_p, n_a, "Welch t-test (indep)", p_t, note])
-        bt_rows.append([col, n_p, n_a, "Mann–Whitney U", p_u, note])
-        bt_rows.append([col, n_p, n_a, "Brunner–Munzel", p_bm, note])
-        eff_rows.append([col, n_p, n_a, cd, r_rb, cles, hl, lo, hi])
-    between_time_df = pd.DataFrame(bt_rows, columns=["Time", "N Placebo", "N Active", "Test", "p-value", "Note"])
-    effect_df = pd.DataFrame(eff_rows, columns=["Time", "N Placebo", "N Active", "Cliff's δ (Active−Placebo)", "Rank-biserial r", "CLES P(Active>Placebo)", "HL shift (A−P)", "HL 95% CI lo", "HL 95% CI hi"])    
+                p_u = np.nan
+            between_rows.append([col, "Welch t-test (indep)", p_t])
+            between_rows.append([col, "Mann–Whitney U", p_u])
+    between_df = pd.DataFrame(between_rows, columns=["Time", "Test", "p-value"]) if between_rows else pd.DataFrame(columns=["Time", "Test", "p-value"])           
 
-    # BETWEEN on Δ from Baseline
+    # ---------- Δ-by-visit BETWEEN-GROUP ----------
     base = ipss_cols[0]
-    bt_delta_rows = []
-    eff_delta_rows = []
-    for col in ipss_cols[1:]:
+    delta_rows = []
+    active_by_visit: Dict[str, np.ndarray] = {}
+    placebo_by_visit: Dict[str, np.ndarray] = {}
+    for col in ipss_cols[1:]:  # post-baseline visits
         d = work[["GROUP_NORM", base, col]].dropna()
         d["DELTA"] = d[col] - d[base]
         pl = d.loc[d["GROUP_NORM"] == "Placebo", "DELTA"].to_numpy()
-        ac = d.loc[d["GROUP_NORM"] == "Active", "DELTA"].to_numpy()
-        n_p, n_a = pl.size, ac.size
-        note = None
-        if n_p >= 2 and n_a >= 2:
+        ac = d.loc[d["GROUP_NORM"] == "Active",  "DELTA"].to_numpy()
+        visit_label = col
+        active_by_visit[visit_label] = ac
+        placebo_by_visit[visit_label] = pl
+        if pl.size >= 2 and ac.size >= 2:
             try:
                 _, p_t = stats.ttest_ind(pl, ac, equal_var=False)
             except Exception:
                 p_t = np.nan
             try:
-                u_stat, p_u = stats.mannwhitneyu(pl, ac, alternative='two-sided')
+                _, p_u = stats.mannwhitneyu(pl, ac, alternative='two-sided')
             except Exception:
-                u_stat, p_u = np.nan, np.nan
-            try:
-                _, p_bm = stats.brunnermunzel(pl, ac, alternative='two-sided')
-            except Exception:
-                p_bm = np.nan
-            cd = cliffs_delta(ac, pl)
-            sign_hint = float(np.median(ac) - np.median(pl))
-            r_rb = rank_biserial_from_u(u_stat if not isinstance(u_stat, float) or not np.isnan(u_stat) else 0.5*n_p*n_a, n_a, n_p, sign_hint)
-            cles = common_language_effect(ac, pl)
-            hl, lo, hi = hl_shift_and_ci(ac, pl)
-        else:
-            p_t = p_u = p_bm = np.nan
-            cd = r_rb = cles = hl = lo = hi = None
-            note = "Insufficient N in one or both groups"
-        bt_delta_rows.append([f"{base} → {col}", n_p, n_a, "Welch t-test (indep)", p_t, note])
-        bt_delta_rows.append([f"{base} → {col}", n_p, n_a, "Mann–Whitney U", p_u, note])
-        bt_delta_rows.append([f"{base} → {col}", n_p, n_a, "Brunner–Munzel", p_bm, note])
-        eff_delta_rows.append([f"{base} → {col}", n_p, n_a, cd, r_rb, cles, hl, lo, hi])
-    between_delta_df = pd.DataFrame(bt_delta_rows, columns=["Change (Δ)", "N Placebo", "N Active", "Test", "p-value", "Note"])
-    effect_delta_df = pd.DataFrame(eff_delta_rows, columns=["Change (Δ)", "N Placebo", "N Active", "Cliff's δ (Active−Placebo)", "Rank-biserial r", "CLES P(Active>Placebo)", "HL shift (A−P)", "HL 95% CI lo", "HL 95% CI hi"])    
+                p_u = np.nan
+            delta_rows.append([f"{base} → {col}", "Welch t-test (indep)", p_t])
+            delta_rows.append([f"{base} → {col}", "Mann–Whitney U", p_u])
+    between_delta_df = pd.DataFrame(delta_rows, columns=["Change (Δ)", "Test", "p-value"]) if delta_rows else pd.DataFrame(columns=["Change (Δ)", "Test", "p-value"])           
 
-    # END-OF-TRIAL FOCUS
-    final_col = ipss_cols[-1]
-    end_tbl = between_time_df[between_time_df["Time"] == final_col].copy()
-    end_delta = between_delta_df[between_delta_df["Change (Δ)"].str.endswith(final_col)].copy()
+    # ---------- Van Elteren on Δ across visits ----------
+    Z, p_ve, counts = van_elteren_delta(active_by_visit, placebo_by_visit)
+    ve_df = pd.DataFrame({
+        "Analysis": ["Van Elteren (Δ across visits; strata = visits)"],
+        "Z": [Z],
+        "p-value": [p_ve]
+    })
+    if counts:
+        counts_df = pd.DataFrame(counts, columns=["Visit (stratum)", "N Placebo", "N Active"])
+    else:
+        counts_df = pd.DataFrame(columns=["Visit (stratum)", "N Placebo", "N Active"])
 
     return {
         "WITHIN": within_df,
-        "BETWEEN_TIME": between_time_df,
+        "BETWEEN": between_df,
         "BETWEEN_DELTA": between_delta_df,
-        "EFFECTS_TIME": effect_df,
-        "EFFECTS_DELTA": effect_delta_df,
-        "END_OF_TRIAL": end_tbl,
-        "END_OF_TRIAL_DELTA": end_delta,
-        "FINAL_COL": pd.DataFrame({"final_timepoint": [final_col]}),
+        "VAN_ELTEREN_DELTA": ve_df,
+        "VAN_ELTEREN_STRATA_COUNTS": counts_df,
     }
 
 
-# ---------- RM / Mixed ANOVA ----------
-
-def compute_mixed_anova(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, pd.DataFrame]:
-    # Melt to long
-    long = df.copy()
-    long["GROUP_NORM"] = label_groups(long["GROUP"])  # Placebo vs Active
-    idcol = "SUBJECT ID"
-    use_cols = [idcol, "GROUP_NORM"] + ipss_cols
-    long = long[use_cols].dropna(subset=ipss_cols)
-    long = long.melt(id_vars=[idcol, "GROUP_NORM"], value_vars=ipss_cols, var_name="Time", value_name="Score")
-
-    out = {}
-    try:
-        import pingouin as pg
-        # Mixed ANOVA: within=Time, between=GROUP_NORM
-        mx = pg.mixed_anova(data=long, dv="Score", within="Time", between="GROUP_NORM", subject=idcol)
-        out["MIXED_ANOVA"] = mx
-        # Sphericity / epsilon
-        try:
-            sph = pg.sphericity(long, dv="Score", subject=idcol, within="Time")
-            out["SPHERICITY"] = pd.DataFrame({"w": [sph[0]], "p": [sph[1]]})
-        except Exception:
-            pass
-    except Exception:
-        # Fallback: within-subject RM-ANOVA (ignores GROUP_NORM factor)
-        try:
-            import statsmodels.api as sm
-            from statsmodels.stats.anova import AnovaRM
-            aov = AnovaRM(long, depvar="Score", subject=idcol, within=["Time"]).fit()
-            out["RM_ANOVA_WITHIN_ONLY"] = pd.read_html(aov.summary().tables[0].as_html(), header=0, index_col=0)[0]
-        except Exception:
-            out["RM_ANOVA_WITHIN_ONLY"] = pd.DataFrame()
-    return out
-
-
-def _fig_to_buffer(fig) -> io.BytesIO:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def to_excel_with_pvalues(original_df: pd.DataFrame, tables: Dict[str, pd.DataFrame], charts: List[Tuple[str, io.BytesIO]]) -> bytes:
+def to_excel_with_pvalues(original_df: pd.DataFrame, tables: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         original_df.to_excel(writer, index=False, sheet_name="Input")
-        start = 0
-        sheet = "P_VALUES"
+        row0 = 0
+        pv_sheet = "P_VALUES"
         sections = [
-            ("END-OF-TRIAL (Placebo vs Active) — Final Timepoint", tables.get("END_OF_TRIAL")),
-            ("END-OF-TRIAL (Placebo vs Active) — Δ from Baseline", tables.get("END_OF_TRIAL_DELTA")),
-            ("BETWEEN-GROUP (Timepoints)", tables.get("BETWEEN_TIME")),
-            ("BETWEEN-GROUP (Δ from Baseline)", tables.get("BETWEEN_DELTA")),
-            ("WITHIN-GROUP (paired across time) — All / Placebo / Active", tables.get("WITHIN")),
+            ("BETWEEN-GROUP (Placebo vs Active) — Final values", tables.get("BETWEEN")),
+            ("BETWEEN-GROUP (Placebo vs Active) — Δ by visit", tables.get("BETWEEN_DELTA")),
+            ("VAN ELTEREN — pooled Δ across visits (stratified Wilcoxon)", tables.get("VAN_ELTEREN_DELTA")),
+            ("VAN ELTEREN — strata counts", tables.get("VAN_ELTEREN_STRATA_COUNTS")),
+            ("WITHIN-GROUP (paired across time)", tables.get("WITHIN")),
         ]
         for title, table in sections:
-            pd.DataFrame({title: []}).to_excel(writer, index=False, sheet_name=sheet, startrow=start)
-            start += 1
+            pd.DataFrame({title: []}).to_excel(writer, index=False, sheet_name=pv_sheet, startrow=row0)
+            row0 += 1
             if table is not None and not table.empty:
-                table.to_excel(writer, index=False, sheet_name=sheet, startrow=start)
-                start += len(table) + 3
+                table.to_excel(writer, index=False, sheet_name=pv_sheet, startrow=row0)
+                row0 += len(table) + 3
             else:
-                pd.DataFrame({"info": ["No results"]}).to_excel(writer, index=False, sheet_name=sheet, startrow=start)
-                start += 3
-
-        # Effect sizes to separate sheets for readability
-        eff_time = tables.get("EFFECTS_TIME")
-        if eff_time is not None and not eff_time.empty:
-            eff_time.to_excel(writer, index=False, sheet_name="EFFECT_SIZES_TIME")
-        eff_delta = tables.get("EFFECTS_DELTA")
-        if eff_delta is not None and not eff_delta.empty:
-            eff_delta.to_excel(writer, index=False, sheet_name="EFFECT_SIZES_DELTA")
-
-        # Mixed / RM ANOVA sheet if provided
-        if "MIXED_ANOVA" in tables:
-            tables["MIXED_ANOVA"].to_excel(writer, index=False, sheet_name="MIXED_ANOVA")
-            if "SPHERICITY" in tables:
-                tables["SPHERICITY"].to_excel(writer, index=False, sheet_name="MIXED_ANOVA", startrow=len(tables["MIXED_ANOVA"]) + 3)
-        elif "RM_ANOVA_WITHIN_ONLY" in tables:
-            tables["RM_ANOVA_WITHIN_ONLY"].to_excel(writer, index=True, sheet_name="RM_ANOVA_WITHIN_ONLY")
-
-        # CHARTS sheet: embed PNGs
-        wb = writer.book
-        ws = wb.add_worksheet("CHARTS")
-        r = 0
-        for title, img_buf in charts:
-            ws.write(r, 0, title)
-            ws.insert_image(r + 1, 0, "chart.png", {"image_data": img_buf, "x_scale": 0.9, "y_scale": 0.9})
-            r += 30
-
+                pd.DataFrame({"info": ["No results"]}).to_excel(writer, index=False, sheet_name=pv_sheet, startrow=row0)
+                row0 += 3
     return output.getvalue()
 
 
-# -------------------------------
-# Charts
-# -------------------------------
-
 def draw_boxplots(df: pd.DataFrame, ipss_cols: List[str]):
     df = df.copy(); df["GROUP_NORM"] = label_groups(df["GROUP"])  
-    figs = []
     for col in ipss_cols:
-        pl = df.loc[df["GROUP_NORM"] == "Placebo", col].dropna()
-        ac = df.loc[df["GROUP_NORM"] == "Active",  col].dropna()
+        groups = [
+            df.loc[df["GROUP_NORM"] == "Placebo", col].dropna(),
+            df.loc[df["GROUP_NORM"] == "Active",  col].dropna(),
+        ]
+        labels = ["Placebo", "Active"]
         fig, ax = plt.subplots()
-        ax.boxplot([pl.values, ac.values], labels=["Placebo", "Active"])
-        ax.set_title(f"{col} — Box plot by group")
+        ax.boxplot(groups, labels=labels)
+        ax.set_title(f"{col} — distribution by group")
         ax.set_ylabel("IPSS Score")
         st.pyplot(fig, use_container_width=True)
-        figs.append((f"Box: {col}", _fig_to_buffer(fig)))
-    return figs
-
-
-def draw_trend_summary(df: pd.DataFrame, ipss_cols: List[str]):
-    df = df.copy(); df["GROUP_NORM"] = label_groups(df["GROUP"])  
-    times = ipss_cols
-    figs = []
-    for g in ("Placebo", "Active"):
-        med = []; q1 = []; q3 = []
-        for col in times:
-            vals = df.loc[df["GROUP_NORM"] == g, col].dropna().values
-            if vals.size:
-                med.append(np.median(vals)); q1.append(np.percentile(vals, 25)); q3.append(np.percentile(vals, 75))
-            else:
-                med.append(np.nan); q1.append(np.nan); q3.append(np.nan)
-        fig, ax = plt.subplots()
-        x = np.arange(len(times))
-        ax.plot(x, med, marker='o')
-        ax.fill_between(x, q1, q3, alpha=0.2)
-        ax.set_xticks(x); ax.set_xticklabels(times, rotation=20)
-        ax.set_title(f"{g}: Median trend with IQR")
-        ax.set_ylabel("IPSS Score")
-        st.pyplot(fig, use_container_width=True)
-        figs.append((f"Trend Median+IQR: {g}", _fig_to_buffer(fig)))
-    return figs
 
 
 # -------------------------------
 # UI
 # -------------------------------
 with st.sidebar:
-    st.header("1) Upload Excel")
+    st.header("Upload")
     uploaded = st.file_uploader("Excel file (.xlsx)", type=["xlsx"])    
-    st.markdown("**Tip:** Stick to the template names; the app auto-detects timepoints.")
+    st.markdown("**Tip:** The app auto-detects timepoints; ensure the four expected columns exist.")
 
 if uploaded is None:
     st.info("Upload an Excel to begin.")
@@ -408,55 +290,41 @@ if not ok:
 st.subheader("Detected Time Points")
 st.write(ipss_cols)
 
-# Compute tests
-with st.spinner("Computing tests & effect sizes..."):
+with st.expander("Preview first 10 rows"):
+    st.dataframe(df.head(10), use_container_width=True)
+
+with st.spinner("Computing p-values (includes Van Elteren on Δ)..."):
     tables = compute_p_values(df, ipss_cols)
 
-# Mixed / RM ANOVA
-with st.spinner("Running RM/Mixed ANOVA..."):
-    anova_tables = compute_mixed_anova(df, ipss_cols)
-    tables.update(anova_tables)
-
-# End-of-trial first
-final_tp = tables["FINAL_COL"].iloc[0, 0]
-st.subheader(f"End-of-trial focus ▸ {final_tp}")
-st.dataframe(tables["END_OF_TRIAL"], use_container_width=True)
-st.dataframe(tables["END_OF_TRIAL_DELTA"], use_container_width=True)
-
-# Full tables
-col1, col2 = st.columns([1,1])
-with col1:
-    st.subheader("Between-Group (Placebo vs Active) — Timepoints")
-    st.caption("Welch t, Mann–Whitney U, Brunner–Munzel + sample sizes & notes.")
-    st.dataframe(tables["BETWEEN_TIME"], use_container_width=True)
-with col2:
-    st.subheader("Between-Group (Placebo vs Active) — Δ from Baseline")
-    st.caption("Tests on change scores vs Baseline.")
+# Display
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("Between-Group p-values — Final values (by timepoint)")
+    st.dataframe(tables["BETWEEN"], use_container_width=True)
+with c2:
+    st.subheader("Between-Group p-values — Δ by visit")
     st.dataframe(tables["BETWEEN_DELTA"], use_container_width=True)
 
-st.subheader("Within-Group (paired across time)")
-st.caption("All / Placebo / Active — Paired t-test & Wilcoxon across timepoint pairs.")
+st.subheader("Van Elteren (Δ across visits; strata = visits)")
+st.dataframe(tables["VAN_ELTEREN_DELTA"], use_container_width=True)
+with st.expander("Stratum sizes used in Van Elteren"):
+    st.dataframe(tables["VAN_ELTEREN_STRATA_COUNTS"], use_container_width=True)
+
+st.subheader("Within-Group p-values (paired across time)")
 st.dataframe(tables["WITHIN"], use_container_width=True)
 
-# Effect sizes
-st.subheader("Effect Sizes & Robust Shifts (non‑parametric friendly)")
-st.caption("Cliff's δ (directional), rank-biserial r, common language effect size, and Hodges–Lehmann shift with 95% CI.")
-st.dataframe(tables["EFFECTS_TIME"], use_container_width=True)
-st.dataframe(tables["EFFECTS_DELTA"], use_container_width=True)
-
-# Charts
-st.subheader("Charts ▸ Distribution (Box) & Trends (Median + IQR)")
-chart_buffers = []
-chart_buffers += draw_boxplots(df, ipss_cols)
-chart_buffers += draw_trend_summary(df, ipss_cols)
+# Plots
+st.subheader("Distribution plots by time point")
+draw_boxplots(df, ipss_cols)
 
 # Download
-excel_bytes = to_excel_with_pvalues(df, tables, chart_buffers)
+excel_bytes = to_excel_with_pvalues(df, tables)
 st.download_button(
-    label="Download results workbook (with P_VALUES, EFFECT_SIZES, ANOVA & CHARTS)",
+    label="Download Excel with P_VALUES (incl. Van Elteren)",
     data=excel_bytes,
-    file_name="ipss_stats_output.xlsx",
+    file_name="ipss_pvalues_output.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-st.success("Done. Results, ANOVA, and charts are ready. Try another file if needed.")
+st.success("Done. Van Elteren added. You can now download results.")
+
