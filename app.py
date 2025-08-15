@@ -1,4 +1,3 @@
-
 import io
 import numpy as np
 import pandas as pd
@@ -55,7 +54,7 @@ uploaded = st.file_uploader("Upload a workbook with a single endpoint table (Bas
 if not uploaded: st.stop()
 
 # Sheet and preview
-xl = pd.ExcelFile(uploaded); sheet_name = st.selectbox("Select sheet", xl.sheet_names, index=0)
+xl = pd.ExcelFile(uploaded, engine='openpyxl'); sheet_name = st.selectbox("Select sheet", xl.sheet_names, index=0)
 raw = pd.read_excel(uploaded, sheet_name=sheet_name)
 st.write("Preview:", raw.head())
 
@@ -403,3 +402,4 @@ st.download_button(
     file_name=f"{base}_{endpoint_name}_RESULTS_v2.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
+
