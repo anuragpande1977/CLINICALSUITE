@@ -1,11 +1,7 @@
-streamlit
-pandas
-numpy
-scipy>=1.9
-openpyxl
-xlsxwriter
-matplotlib
-# Optional (advanced models; app still runs without these)
-statsmodels
-pingouin
-rpy2
+streamlit==1.37.1
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.8.4
+openpyxl==3.1.5
+xlsxwriter==3.2.0
