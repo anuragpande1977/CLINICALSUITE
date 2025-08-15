@@ -8,7 +8,7 @@ Deploy notes (works on Streamlit Cloud):
 - requirements.txt should include (pin versions as you like):
   streamlit
   pandas
-  scipy
+  scipy>=1.9
   openpyxl
   xlsxwriter
   matplotlib
@@ -35,7 +35,9 @@ import streamlit as st
 
 st.set_page_config(page_title="IPSS P-Values (4 Time Points)", layout="wide")
 st.title("IPSS (4 Time Points): P-Values Explorer")
-st.caption("Upload your Excel. The app computes within- and between-group p-values using parametric and non-parametric tests, and provides a downloadable Excel with results.")
+st.caption(
+    "Upload your Excel. The app computes within- and between-group p-values using parametric (t-tests) and non-parametric (Wilcoxon, Mann–Whitney, Brunner–Munzel) tests, and provides a downloadable Excel with results."
+)
 
 # -------------------------------
 # Utilities
@@ -47,7 +49,10 @@ TIME_ORDER_MAP = {
     "day 84": 84,
 }
 
-IPSS_COL_REGEX = re.compile(r"^(baseline|day\s*28|day\s*56|day\s*84).*ipss.*total\s*score", re.IGNORECASE)
+IPSS_COL_REGEX = re.compile(
+    r"^(baseline|day\s*28|day\s*56|day\s*84).*ipss.*total\s*score",
+    re.IGNORECASE,
+)
 
 REQUIRED_ID_COLS = ["SUBJECT ID", "GROUP"]
 
@@ -64,6 +69,7 @@ def find_ipss_columns(columns: List[str]) -> List[str]:
             if k in s:
                 return v
         return 10_000
+
     cand_sorted = sorted(cand, key=time_key)
     return cand_sorted
 
@@ -74,7 +80,11 @@ def validate_template(df: pd.DataFrame) -> Tuple[bool, str, List[str]]:
         return False, f"Missing required columns: {missing_ids}", []
     ipss_cols = find_ipss_columns(df.columns.tolist())
     if len(ipss_cols) != 4:
-        return False, "Could not detect exactly 4 IPSS timepoint columns. Ensure columns contain 'Baseline', 'Day 28', 'Day 56', 'Day 84' and 'IPSS  Total Score'.", ipss_cols
+        return (
+            False,
+            "Could not detect exactly 4 IPSS timepoint columns. Ensure columns contain 'Baseline', 'Day 28', 'Day 56', 'Day 84' and 'IPSS  Total Score'.",
+            ipss_cols,
+        )
     return True, "", ipss_cols
 
 
@@ -83,66 +93,126 @@ def label_groups(series: pd.Series) -> pd.Series:
     return np.where(series.astype(str).str.strip().str.lower() == "placebo", "Placebo", "Active")
 
 
+def group_counts(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    rows = []
+    for col in cols:
+        for g in ("Placebo", "Active"):
+            n = df.loc[df["GROUP_NORM"] == g, col].dropna().shape[0]
+            rows.append([col, g, n])
+    return pd.DataFrame(rows, columns=["Time", "Group", "N"])
+
+
 @st.cache_data(show_spinner=False)
 def compute_p_values(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, pd.DataFrame]:
-    """Compute within-group (paired t, Wilcoxon) for each group and entire cohort,
-    and between-group (indep t, Mann-Whitney) at each time point.
+    """Compute:
+    - WITHIN-GROUP (paired): Paired t-test, Wilcoxon for All, Placebo, Active
+    - BETWEEN-GROUP (timepoint): Welch t-test, Mann–Whitney U, Brunner–Munzel
+    - BETWEEN-GROUP (delta from baseline): Welch t-test, Mann–Whitney U, Brunner–Munzel
     Returns dict of tables.
     """
     work = df.copy()
     work["GROUP_NORM"] = label_groups(work["GROUP"])  # Placebo vs Active
 
-    # Drop rows that have NA for any of the four IPSS columns for within-subject comparisons
-    within_ready = work.dropna(subset=ipss_cols)
-
     # ---------- WITHIN-GROUP (paired) ----------
-    records = []
+    within_ready = work.dropna(subset=ipss_cols)
+    within_records = []
     groups_for_within = ["All", "Placebo", "Active"]
     for g in groups_for_within:
         dsub = within_ready if g == "All" else within_ready[within_ready["GROUP_NORM"] == g]
         if len(dsub) < 3:
-            # too small for robust paired tests
             continue
         for i in range(4):
             for j in range(i + 1, 4):
                 a, b = ipss_cols[i], ipss_cols[j]
                 # Paired t-test
                 try:
-                    t_stat, p_t = stats.ttest_rel(dsub[a], dsub[b], nan_policy='omit')
+                    _, p_t = stats.ttest_rel(dsub[a], dsub[b], nan_policy="omit")
                 except Exception:
                     p_t = np.nan
                 # Wilcoxon signed-rank
                 try:
-                    w_stat, p_w = stats.wilcoxon(dsub[a], dsub[b], zero_method='wilcox', alternative='two-sided', mode='auto')
+                    _, p_w = stats.wilcoxon(dsub[a], dsub[b], zero_method="wilcox", alternative="two-sided", mode="auto")
                 except Exception:
                     p_w = np.nan
-                records.append([g, a, b, "Paired t-test", p_t])
-                records.append([g, a, b, "Wilcoxon signed-rank", p_w])
-    within_df = pd.DataFrame(records, columns=["Group", "Time A", "Time B", "Test", "p-value"]) if records else pd.DataFrame(columns=["Group", "Time A", "Time B", "Test", "p-value"])            
+                within_records.append([g, a, b, "Paired t-test", p_t])
+                within_records.append([g, a, b, "Wilcoxon signed-rank", p_w])
+    within_df = (
+        pd.DataFrame(within_records, columns=["Group", "Time A", "Time B", "Test", "p-value"])
+        if within_records
+        else pd.DataFrame(columns=["Group", "Time A", "Time B", "Test", "p-value"])
+    )
 
-    # ---------- BETWEEN-GROUP (independent) at each time ----------
-    records = []
+    # ---------- BETWEEN-GROUP (timepoint) ----------
+    bt_time_records = []
     for col in ipss_cols:
         placebo = work.loc[work["GROUP_NORM"] == "Placebo", col].dropna()
         active = work.loc[work["GROUP_NORM"] == "Active", col].dropna()
-        if len(placebo) >= 2 and len(active) >= 2:
+        n_p, n_a = len(placebo), len(active)
+        note = None
+        if n_p >= 2 and n_a >= 2:
             # Welch t-test
             try:
-                t_stat, p_t = stats.ttest_ind(placebo, active, equal_var=False, nan_policy='omit')
+                _, p_t = stats.ttest_ind(placebo, active, equal_var=False, nan_policy="omit")
             except Exception:
                 p_t = np.nan
-            # Mann-Whitney U
+            # Mann–Whitney U
             try:
-                u_stat, p_u = stats.mannwhitneyu(placebo, active, alternative='two-sided')
+                _, p_u = stats.mannwhitneyu(placebo, active, alternative="two-sided")
             except Exception:
                 p_u = np.nan
-            records.append([col, "Welch t-test (indep)", p_t])
-            records.append([col, "Mann-Whitney U", p_u])
-    between_df = pd.DataFrame(records, columns=["Time", "Test", "p-value"]) if records else pd.DataFrame(columns=["Time", "Test", "p-value"])           
+            # Brunner–Munzel (more robust to unequal variances/ties)
+            try:
+                _, p_bm = stats.brunnermunzel(placebo, active, alternative="two-sided")
+            except Exception:
+                p_bm = np.nan
+        else:
+            p_t = p_u = p_bm = np.nan
+            note = "Insufficient N in one or both groups"
+        bt_time_records.append([col, n_p, n_a, "Welch t-test (indep)", p_t, note])
+        bt_time_records.append([col, n_p, n_a, "Mann–Whitney U", p_u, note])
+        bt_time_records.append([col, n_p, n_a, "Brunner–Munzel", p_bm, note])
+    between_time_df = pd.DataFrame(
+        bt_time_records, columns=["Time", "N Placebo", "N Active", "Test", "p-value", "Note"]
+    )
+
+    # ---------- BETWEEN-GROUP (delta from baseline) ----------
+    bt_delta_records = []
+    base = ipss_cols[0]
+    for col in ipss_cols[1:]:
+        d = work[["GROUP_NORM", base, col]].dropna()
+        d["DELTA"] = d[col] - d[base]
+        placebo = d.loc[d["GROUP_NORM"] == "Placebo", "DELTA"].dropna()
+        active = d.loc[d["GROUP_NORM"] == "Active", "DELTA"].dropna()
+        n_p, n_a = len(placebo), len(active)
+        note = None
+        if n_p >= 2 and n_a >= 2:
+            try:
+                _, p_t = stats.ttest_ind(placebo, active, equal_var=False)
+            except Exception:
+                p_t = np.nan
+            try:
+                _, p_u = stats.mannwhitneyu(placebo, active, alternative="two-sided")
+            except Exception:
+                p_u = np.nan
+            try:
+                _, p_bm = stats.brunnermunzel(placebo, active, alternative="two-sided")
+            except Exception:
+                p_bm = np.nan
+        else:
+            p_t = p_u = p_bm = np.nan
+            note = "Insufficient N in one or both groups"
+        bt_delta_records.append([f"{base} → {col}", n_p, n_a, "Welch t-test (indep)", p_t, note])
+        bt_delta_records.append([f"{base} → {col}", n_p, n_a, "Mann–Whitney U", p_u, note])
+        bt_delta_records.append([f"{base} → {col}", n_p, n_a, "Brunner–Munzel", p_bm, note])
+    between_delta_df = pd.DataFrame(
+        bt_delta_records, columns=["Change (Δ)", "N Placebo", "N Active", "Test", "p-value", "Note"]
+    )
 
     return {
         "WITHIN": within_df,
-        "BETWEEN": between_df,
+        "BETWEEN_TIME": between_time_df,
+        "BETWEEN_DELTA": between_delta_df,
+        "COUNTS": group_counts(work.assign(GROUP_NORM=work["GROUP_NORM"]), ipss_cols),
     }
 
 
@@ -151,19 +221,22 @@ def to_excel_with_pvalues(original_df: pd.DataFrame, tables: Dict[str, pd.DataFr
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         original_df.to_excel(writer, index=False, sheet_name="Input")
-        row0 = 0
-        # One sheet summarizing all p-values
-        pv_sheet = "P_VALUES"
-        for name, table in tables.items():
-            # Write section title
-            pd.DataFrame({name: []}).to_excel(writer, index=False, sheet_name=pv_sheet, startrow=row0)
-            row0 += 1
+        # One sheet summarizing all p-values, with section headers
+        start = 0
+        sheet = "P_VALUES"
+        for name in ("WITHIN", "BETWEEN_TIME", "BETWEEN_DELTA"):
+            pd.DataFrame({name: []}).to_excel(writer, index=False, sheet_name=sheet, startrow=start)
+            start += 1
+            table = tables.get(name)
             if table is not None and not table.empty:
-                table.to_excel(writer, index=False, sheet_name=pv_sheet, startrow=row0)
-                row0 += len(table) + 3
+                table.to_excel(writer, index=False, sheet_name=sheet, startrow=start)
+                start += len(table) + 3
             else:
-                pd.DataFrame({"info": ["No results"]}).to_excel(writer, index=False, sheet_name=pv_sheet, startrow=row0)
-                row0 += 3
+                pd.DataFrame({"info": ["No results"]}).to_excel(writer, index=False, sheet_name=sheet, startrow=start)
+                start += 3
+        # counts sheet for transparency
+        if "COUNTS" in tables and not tables["COUNTS"].empty:
+            tables["COUNTS"].to_excel(writer, index=False, sheet_name="GROUP_COUNTS")
     return output.getvalue()
 
 
@@ -193,7 +266,9 @@ def draw_boxplots(df: pd.DataFrame, ipss_cols: List[str]):
 with st.sidebar:
     st.header("Upload")
     uploaded = st.file_uploader("Excel file (.xlsx)", type=["xlsx"])    
-    st.markdown("**Tip:** Make sure your columns match the expected names; the app will auto-detect timepoint columns.")
+    st.markdown(
+        "**Tip:** Keep consistent column names; the app auto-detects timepoint columns. Non-parametric between-group tests include Mann–Whitney and Brunner–Munzel."
+    )
 
 if uploaded is None:
     st.info("Upload an Excel to begin.")
@@ -225,12 +300,21 @@ with st.spinner("Computing p-values..."):
 
 left, right = st.columns([1, 1])
 with left:
-    st.subheader("Between-Group p-values (Placebo vs Active)")
-    st.dataframe(tables["BETWEEN"], use_container_width=True)
+    st.subheader("Between-Group p-values (Timepoints)")
+    st.caption("Welch t-test, Mann–Whitney U, Brunner–Munzel at each timepoint.")
+    st.dataframe(tables["BETWEEN_TIME"], use_container_width=True)
 with right:
-    st.subheader("Within-Group p-values (paired across time)")
-    st.caption("Shown for All, Placebo, and Active groups (paired t-test and Wilcoxon).")
-    st.dataframe(tables["WITHIN"], use_container_width=True)
+    st.subheader("Between-Group p-values (Δ from Baseline)")
+    st.caption("Welch t-test, Mann–Whitney U, Brunner–Munzel on change scores vs Baseline.")
+    st.dataframe(tables["BETWEEN_DELTA"], use_container_width=True)
+
+st.subheader("Within-Group p-values (paired across time)")
+st.caption("Shown for All, Placebo, and Active groups (paired t-test and Wilcoxon).")
+st.dataframe(tables["WITHIN"], use_container_width=True)
+
+# Diagnostics
+with st.expander("Group counts by timepoint"):
+    st.dataframe(tables["COUNTS"], use_container_width=True)
 
 # Plots
 st.subheader("Distribution plots by time point")
