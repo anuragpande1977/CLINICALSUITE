@@ -1,483 +1,166 @@
-import io
-import numpy as np
-import pandas as pd
-import streamlit as st
+st.success(f"Detected: **{used_mode}** on sheet **{used_sheet}**")
+```)
+2) And **before** you compute `all_groups` and the pairwise selections.
 
-# ---- Excel engine guard (required for .xlsx) ----
+> If you can, also set `RAW_DF = df` at the point where you detect the usable sheet, so we can reference the original sheet for Age/Weight/BMI/Status discovery. (See the first 10 lines of the snippet for how to add that if you don’t already have it.)
+
+---
+
+### Paste this block
+
+```python
+# ===== NEW: Capture the raw sheet used (do this where you detect the usable sheet) =====
+# If you already have RAW_DF bound to the detected sheet DataFrame, you can skip this.
 try:
-    import openpyxl  # noqa: F401
-except Exception as e:
-    st.error("This app needs the 'openpyxl' package to read .xlsx files.\n"
-             "Add it to requirements.txt and redeploy.\n\n"
-             f"Import error: {e}")
-    st.stop()
+    RAW_DF  # noqa: F821
+except NameError:
+    RAW_DF = df  # the 'df' you used to build long_change/change_wide/input_echo
 
-st.set_page_config(page_title="Clinical Analysis Suite — Full", layout="wide")
-st.title("Clinical Analysis Suite — Full Version")
-st.caption(
-    "Upload any endpoint table with Subject/Group and Baseline, Day28, Day56, Day84. "
-    "Map your columns, choose analysis-set filters (ITT/PP/Completers; exclude Dropped AE; Weight/BMI thresholds), "
-    "define custom responder rules, and run parametric/nonparametric analyses. "
-    "Includes MMRM, Group×Weight, maximally-selected weight cut (permutation-adjusted), and Excel export."
-)
+# ===== NEW: Analysis set & filter controls (Sidebar) =====
+with st.sidebar:
+    st.markdown("### Analysis Set & Filters")
+    # Analysis-set toggles
+    use_itt = st.checkbox("ITT / mITT (default include all)", value=True)
+    use_pp = st.checkbox("PP (Status == ACTIVE)", value=False)
+    use_completers = st.checkbox("Completers (has Day84)", value=False)
+    excl_dae = st.checkbox("Exclude 'Dropped AE'", value=False)
 
-# --------------------- Utilities ---------------------
-def try_numeric(x):
-    return pd.to_numeric(x, errors="coerce")
+    st.markdown("---")
+    st.caption("Numeric filters (apply only if boxes are ticked)")
 
-def ensure_cat_time(df, order):
-    if df.empty: return df
-    df["Time"] = pd.Categorical(df["Time"], categories=order, ordered=True)
-    return df
+    # Try to detect useful columns on RAW_DF
+    age_col    = infer_col(RAW_DF, ("age",))
+    weight_col = infer_col(RAW_DF, ("weight",)) or infer_col(RAW_DF, ("wt",)) or infer_col(RAW_DF, ("kg",))
+    bmi_col    = infer_col(RAW_DF, ("bmi",))
+    status_col = infer_col(RAW_DF, ("status",))
 
-def safe_pct_improve(baseline, final):
-    baseline = np.asarray(baseline, dtype=float)
-    final = np.asarray(final, dtype=float)
-    out = np.full_like(baseline, np.nan, dtype=float)
-    mask = np.isfinite(baseline) & np.isfinite(final) & (baseline != 0)
-    out[mask] = (baseline[mask] - final[mask]) / baseline[mask]
-    return out
+    # Age filter
+    use_age = False
+    if age_col:
+        a_vals = pd.to_numeric(RAW_DF[age_col], errors="coerce")
+        a_min, a_max = float(np.nanmin(a_vals)), float(np.nanmax(a_vals))
+        use_age = st.checkbox(f"Filter by Age ({age_col})", value=False)
+        if use_age:
+            age_range = st.slider("Age range", min_value=int(np.floor(a_min)),
+                                  max_value=int(np.ceil(a_max)),
+                                  value=(int(np.floor(a_min)), int(np.ceil(a_max))))
+    # Weight filter
+    use_wt = False
+    if weight_col:
+        w_vals = pd.to_numeric(RAW_DF[weight_col], errors="coerce")
+        w_min, w_max = float(np.nanmin(w_vals)), float(np.nanmax(w_vals))
+        use_wt = st.checkbox(f"Filter by Weight ({weight_col})", value=False)
+        if use_wt:
+            weight_range = st.slider("Weight (kg)", min_value=float(np.floor(w_min)),
+                                     max_value=float(np.ceil(w_max)),
+                                     value=(float(np.floor(w_min)), float(np.ceil(w_max))), step=0.5)
+    # BMI filter
+    use_bmi = False
+    if bmi_col:
+        b_vals = pd.to_numeric(RAW_DF[bmi_col], errors="coerce")
+        b_min, b_max = float(np.nanmin(b_vals)), float(np.nanmax(b_vals))
+        use_bmi = st.checkbox(f"Filter by BMI ({bmi_col})", value=False)
+        if use_bmi:
+            bmi_range = st.slider("BMI", min_value=float(np.floor(b_min)),
+                                  max_value=float(np.ceil(b_max)),
+                                  value=(float(np.floor(b_min)), float(np.ceil(b_max))), step=0.1)
 
-def cliffs_delta(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    m, n = len(a), len(b)
-    if m == 0 or n == 0: return np.nan
-    wins = 0
-    for x in a:
-        wins += np.sum(x > b) - np.sum(x < b)
-    return wins / (m * n)
+    st.markdown("---")
+    # Optional status-based exclusions
+    custom_excl_status = []
+    if status_col:
+        status_vals = (RAW_DF[status_col].astype(str).str.strip().replace({"": np.nan}).dropna().unique().tolist())
+        status_vals = sorted(status_vals)
+        if status_vals:
+            custom_excl_status = st.multiselect("Exclude Status values", status_vals, default=[])
 
-def hodges_lehmann(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    if len(a) == 0 or len(b) == 0: return np.nan
-    diffs = a.reshape(-1,1) - b.reshape(1,-1)
-    return float(np.median(diffs))
+    # Optional subject ID exclusions (comma-separated)
+    manual_excl_subjects = st.text_input("Exclude Subject IDs (comma-separated)", value="").strip()
 
-VISIT_KEYS = ["Day28","Day56","Day84"]
+# ===== NEW: Build subject-level meta (Subject, Status, Age, Weight, BMI) =====
+# Find a Subject column on RAW_DF; otherwise use what's already in long_change/input_echo
+subj_col = infer_col(RAW_DF, ("subject",)) or infer_col(RAW_DF, ("id",))
+if not subj_col:
+    # Fallbacks
+    if input_echo is not None and "Subject" in input_echo.columns:
+        subj_col = "Subject"
+        RAW_DF = RAW_DF.copy()
+        RAW_DF[subj_col] = input_echo["Subject"]
+    elif "Subject" in long_change.columns:
+        subj_col = "Subject"
+        RAW_DF = RAW_DF.copy()
+        RAW_DF[subj_col] = long_change["Subject"].drop_duplicates().to_list() + [np.nan]  # best-effort
 
-# --------------------- 1) Upload ---------------------
-st.subheader("1) Upload Excel")
-uploaded = st.file_uploader("Upload a workbook (.xlsx)", type=["xlsx"])
-if not uploaded:
-    st.info("Upload a file to begin.")
-    st.stop()
+subject_meta = pd.DataFrame({"Subject": RAW_DF[subj_col].astype(str)})
 
-file_bytes = uploaded.read()
-bio = io.BytesIO(file_bytes)
+if status_col:
+    subject_meta["Status"] = RAW_DF[status_col].astype(str)
+if age_col:
+    subject_meta["Age"] = pd.to_numeric(RAW_DF[age_col], errors="coerce")
+if weight_col:
+    subject_meta["Weight"] = pd.to_numeric(RAW_DF[weight_col], errors="coerce")
+if bmi_col:
+    subject_meta["BMI"] = pd.to_numeric(RAW_DF[bmi_col], errors="coerce")
 
-# Detect sheets and preview
-try:
-    xl = pd.ExcelFile(bio, engine="openpyxl")
-    sheet_name = st.selectbox("Select sheet", xl.sheet_names, index=0)
-    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine="openpyxl")
-except Exception as e:
-    st.error("Failed to read Excel with openpyxl. Ensure it's a valid .xlsx.\n\n" + str(e))
-    st.stop()
+# ===== NEW: Completers logic (has Day84) =====
+complete_subjects = set()
+if input_echo is not None and "Day84" in input_echo.columns:
+    complete_subjects = set(input_echo[input_echo["Day84"].notna()]["Subject"].astype(str))
+elif change_wide is not None:
+    day84_change_col = None
+    for c in change_wide.columns:
+        if "day84" in str(c).lower() and "change" in str(c).lower():
+            day84_change_col = c; break
+    if day84_change_col:
+        complete_subjects = set(change_wide[change_wide[day84_change_col].notna()]["Subject"].astype(str))
 
-st.write("Preview:", raw.head())
+# ===== NEW: Build keep mask =====
+keep_mask = pd.Series(True, index=subject_meta["Subject"])
 
-# --------------------- 2) Map columns ---------------------
-st.subheader("2) Map columns")
-cols = list(raw.columns)
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    col_subject = st.selectbox("Subject ID column", cols, index=0)
-with c2:
-    col_group   = st.selectbox("Group column", cols, index=min(1,len(cols)-1))
-with c3:
-    col_baseline = st.selectbox("Baseline column", cols, index=min(2,len(cols)-1))
-with c4:
-    endpoint_name = st.text_input("Endpoint name (e.g., IPSS, QOL)", value="IPSS")
+# ITT/mITT is the default; other toggles refine that:
+if use_pp and "Status" in subject_meta.columns:
+    keep_mask &= (subject_meta["Status"].str.upper().str.strip() == "ACTIVE")
 
-dcols = st.multiselect("Select visit columns (pick Day28, Day56, Day84 equivalents)",
-                       options=cols, default=[c for c in cols if "28" in str(c) or "56" in str(c) or "84" in str(c)][:3])
-# Provide mapping widgets for Day28/Day56/Day84
-def _guess_col(key):
-    for c in cols:
-        s = str(c).lower().replace(" ", "")
-        if key in s: return c
-    return dcols[0] if dcols else cols[min(3,len(cols)-1)]
+if use_completers and len(complete_subjects) > 0:
+    keep_mask &= subject_meta["Subject"].isin(complete_subjects)
 
-col_d28 = st.selectbox("Day 28 column", cols, index=cols.index(_guess_col("day28")) if _guess_col("day28") in cols else min(3,len(cols)-1))
-col_d56 = st.selectbox("Day 56 column", cols, index=cols.index(_guess_col("day56")) if _guess_col("day56") in cols else min(4,len(cols)-1))
-col_d84 = st.selectbox("Day 84 column", cols, index=cols.index(_guess_col("day84")) if _guess_col("day84") in cols else min(5,len(cols)-1))
+if excl_dae and "Status" in subject_meta.columns:
+    keep_mask &= ~subject_meta["Status"].str.contains("Dropped AE", case=False, na=False)
 
-# Optional meta
-c5, c6, c7 = st.columns(3)
-with c5:
-    col_status = st.selectbox("Status column (optional)", ["<none>"] + cols, index=0)
-with c6:
-    col_weight = st.selectbox("Weight column (optional)", ["<none>"] + cols, index=0)
-with c7:
-    col_bmi    = st.selectbox("BMI column (optional)", ["<none>"] + cols, index=0)
+# Custom status exclusions
+if custom_excl_status and "Status" in subject_meta.columns:
+    keep_mask &= ~subject_meta["Status"].isin(set(custom_excl_status))
 
-# Build standardized input
-inp = pd.DataFrame({
-    "Subject": raw[col_subject],
-    "Group": raw[col_group].astype(str).str.strip(),
-    "Baseline": try_numeric(raw[col_baseline]),
-    "Day28": try_numeric(raw[col_d28]),
-    "Day56": try_numeric(raw[col_d56]),
-    "Day84": try_numeric(raw[col_d84]),
-})
-if col_status != "<none>": inp["Status"] = raw[col_status].astype(str)
-if col_weight != "<none>": inp["Weight"] = try_numeric(raw[col_weight])
-if col_bmi    != "<none>": inp["BMI"]    = try_numeric(raw[col_bmi])
+# Numeric filters
+if use_age and "Age" in subject_meta.columns:
+    keep_mask &= subject_meta["Age"].between(age_range[0], age_range[1], inclusive="both")
+if use_wt and "Weight" in subject_meta.columns:
+    keep_mask &= subject_meta["Weight"].between(weight_range[0], weight_range[1], inclusive="both")
+if use_bmi and "BMI" in subject_meta.columns:
+    keep_mask &= subject_meta["BMI"].between(bmi_range[0], bmi_range[1], inclusive="both")
 
-# Long change + raw
-rows = []
-for _, r in inp.iterrows():
-    for v in VISIT_KEYS:
-        if pd.notna(r[v]):
-            rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(r[v]-r["Baseline"])})
-long_change = pd.DataFrame(rows)
-long_change = ensure_cat_time(long_change, VISIT_KEYS) if not long_change.empty else long_change
+# Manual subject exclusions
+if manual_excl_subjects:
+    excl_list = [s.strip() for s in manual_excl_subjects.split(",") if s.strip()]
+    if excl_list:
+        keep_mask &= ~subject_meta["Subject"].isin(excl_list)
 
-rows_raw = []
-for _, r in inp.iterrows():
-    for v in VISIT_KEYS:
-        if pd.notna(r[v]):
-            rows_raw.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v,
-                             endpoint_name: float(r[v]), "Baseline": float(r["Baseline"]),
-                             "Weight": r.get("Weight", np.nan)})
-long_raw = pd.DataFrame(rows_raw)
-long_raw = ensure_cat_time(long_raw, VISIT_KEYS) if not long_raw.empty else long_raw
+keep_ids = set(subject_meta.loc[keep_mask, "Subject"].astype(str))
 
-st.subheader("Mapped data (head)")
-st.dataframe(inp.head())
+# ===== NEW: Apply to analysis tables (in place) =====
+def _apply_subject_filter(df, subject_col="Subject"):
+    if df is None or df.empty or subject_col not in df.columns:
+        return df
+    return df[df[subject_col].astype(str).isin(keep_ids)].copy()
 
-# --------------------- 3) Analysis-set & filters ---------------------
-st.subheader("3) Analysis set & filters")
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1: use_itt = st.checkbox("ITT/mITT (default)", value=True)
-with c2: use_pp = st.checkbox("PP (Status == ACTIVE)", value=False)
-with c3: use_completers = st.checkbox("Completers (has Day84)", value=False)
-with c4: excl_dae = st.checkbox("Exclude 'Dropped AE'", value=False)
-with c5: custom_pair = st.checkbox("Custom pair (choose groups)", value=True)
+# Filter the three working tables your program uses downstream
+long_change = _apply_subject_filter(long_change, "Subject")
+change_wide = _apply_subject_filter(change_wide, "Subject")
+if input_echo is not None:
+    input_echo = _apply_subject_filter(input_echo, "Subject")
 
-c6, c7 = st.columns(2)
-with c6:
-    w_thr_on = st.checkbox("Filter: Weight < threshold", value=False)
-    w_thr = st.number_input("Weight threshold (kg)", value=120.0, step=1.0)
-with c7:
-    b_thr_on = st.checkbox("Filter: BMI < threshold", value=False)
-    b_thr = st.number_input("BMI threshold", value=35.0, step=0.5)
+st.info(f"Filters applied — kept **{len(keep_ids)}** subjects.")
 
-groups_all = sorted(inp["Group"].dropna().unique().tolist())
-if custom_pair and len(groups_all) >= 2:
-    cpa, cpb = st.columns(2)
-    with cpa: gA = st.selectbox("Group A", groups_all, index=0)
-    with cpb: gB = st.selectbox("Group B", groups_all, index=1)
-else:
-    gA, gB = (groups_all[0], groups_all[1]) if len(groups_all)>=2 else (None, None)
+# ===== OPTIONAL: Recompute available groups AFTER filtering =====
+all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique().tolist())
 
-# Subject mask
-keep = pd.Series(True, index=inp["Subject"])
-if excl_dae and ("Status" in inp.columns):
-    bad = inp["Subject"][inp["Status"].astype(str).str.contains("Dropped AE", case=False, na=False)]
-    keep.loc[bad] = False
-if use_pp and ("Status" in inp.columns):
-    keep &= (inp["Status"].astype(str).str.upper() == "ACTIVE")
-if use_completers:
-    keep &= inp["Day84"].notna()
-if w_thr_on and ("Weight" in inp.columns):
-    keep &= (inp["Weight"] < w_thr)
-if b_thr_on and ("BMI" in inp.columns):
-    keep &= (inp["BMI"] < b_thr)
-
-keep_ids = set(inp["Subject"][keep])
-inp_f = inp[inp["Subject"].isin(keep_ids)].copy()
-lc_f  = long_change[long_change["Subject"].isin(keep_ids)].copy()
-lr_f  = long_raw[long_raw["Subject"].isin(keep_ids)].copy()
-st.write(f"Kept N subjects: {len(keep_ids)}")
-
-# --------------------- 4) RM across groups ---------------------
-st.subheader("4) Repeated measures across ALL groups (rank-based ANOVA)")
-rm_df = pd.DataFrame({"Effect":["Group (all groups)", "Time", "Group × Time"], "p-value":[np.nan,np.nan,np.nan]})
-if not lc_f.empty:
-    # Lazy import heavy stats on-demand
-    import statsmodels.formula.api as smf
-    from statsmodels.formula.api import ols
-    from statsmodels.stats.anova import anova_lm
-    lc = lc_f.copy()
-    lc["rank_change"] = lc["Change"].rank(method="average")
-    model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
-    an = anova_lm(model, typ=3)
-    rm_df = pd.DataFrame({
-        "Effect": ["Group (all groups)", f"Time ({', '.join(VISIT_KEYS)})", "Group × Time"],
-        "p-value": [float(an.loc["C(Group)","PR(>F)"]),
-                    float(an.loc["C(Time)","PR(>F)"]),
-                    float(an.loc["C(Group):C(Time)","PR(>F)"])]
-    })
-st.dataframe(rm_df)
-
-# --------------------- 5) Pairwise per-visit ---------------------
-st.subheader("5) Pairwise tests per visit")
-pair_df = pd.DataFrame()
-if gA and gB and not lc_f.empty:
-    from scipy.stats import mannwhitneyu, brunnermunzel, ttest_ind
-    rows = []
-    for v in VISIT_KEYS:
-        a = lc_f[(lc_f["Group"]==gA) & (lc_f["Time"]==v)]["Change"].dropna()
-        b = lc_f[(lc_f["Group"]==gB) & (lc_f["Time"]==v)]["Change"].dropna()
-        if len(a)>0 and len(b)>0:
-            U, mw_p = mannwhitneyu(a, b, alternative="two-sided")
-            bm_stat = bm_p = np.nan
-            if len(a)>3 and len(b)>3: bm_stat, bm_p = brunnermunzel(a, b, alternative="two-sided")
-            t_stat = t_p = (np.nan, np.nan)
-            if len(a)>1 and len(b)>1: t_stat, t_p = ttest_ind(a, b, equal_var=False)
-            rows.append({"Visit": v, f"N {gA}":len(a), f"N {gB}":len(b),
-                         "Mann–Whitney p": float(mw_p),
-                         "Brunner–Munzel p": float(bm_p) if bm_p==bm_p else np.nan,
-                         "Welch t p": float(t_p) if t_p==t_p else np.nan})
-        else:
-            rows.append({"Visit": v, f"N {gA}":len(a), f"N {gB}":len(b),
-                         "Mann–Whitney p": np.nan, "Brunner–Munzel p": np.nan, "Welch t p": np.nan})
-    pair_df = pd.DataFrame(rows)
-st.dataframe(pair_df)
-
-# --------------------- 6) Within-group ---------------------
-st.subheader("6) Within-group change tests (Baseline → each visit)")
-within_rows = []
-if not inp_f.empty:
-    from scipy.stats import wilcoxon, ttest_rel
-    for grp in sorted(inp_f["Group"].unique().tolist()):
-        g = inp_f[inp_f["Group"]==grp]
-        base = g["Baseline"]
-        for v in VISIT_KEYS:
-            fol = g[v]
-            paired = pd.concat([base, fol], axis=1).dropna()
-            if paired.shape[0]>0:
-                try: w_p = wilcoxon(paired.iloc[:,0], paired.iloc[:,1], alternative="two-sided", zero_method="wilcox")[1]
-                except Exception: w_p = np.nan
-                try: t_p = ttest_rel(paired.iloc[:,0], paired.iloc[:,1])[1]
-                except Exception: t_p = np.nan
-            else:
-                w_p = t_p = np.nan
-            within_rows.append({"Group":grp, "Visit":v, "N (paired)":int(paired.shape[0]),
-                                "Wilcoxon p": float(w_p) if w_p==w_p else np.nan,
-                                "Paired t p": float(t_p) if t_p==t_p else np.nan})
-within_df = pd.DataFrame(within_rows)
-st.dataframe(within_df)
-
-# --------------------- 7) End-of-trial models ---------------------
-st.subheader("7) End-of-trial (Day-84) — model-based")
-final_key = "Day84"
-from scipy.stats import norm as _norm
-
-anc_p = np.nan
-if not inp_f.empty and final_key in inp_f.columns:
-    import statsmodels.formula.api as smf
-    use = inp_f[["Subject","Group","Baseline",final_key]].dropna().copy()
-    if use["Group"].nunique() >= 2:
-        use["chg"] = use[final_key] - use["Baseline"]
-        use["Group_bin"] = (use["Group"].astype(str).str.strip() != "Placebo").astype(int)
-        mod = smf.ols("chg ~ Group_bin + Baseline", data=use).fit(cov_type="HC3")
-        anc_p = float(mod.pvalues.get("Group_bin", np.nan))
-
-mmrm_p = np.nan
-if not lr_f.empty:
-    try:
-        import statsmodels.formula.api as smf
-        from statsmodels.formula.api import mixedlm
-        lr = lr_f.dropna(subset=[endpoint_name,"Group","Time","Baseline"]).copy()
-        if not lr.empty:
-            lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
-            lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
-            m = mixedlm(f"{endpoint_name} ~ BL_centered + C(Time) + Group_bin + Group_bin:C(Time)",
-                        lr, groups=lr["Subject"], re_formula="1").fit(method="lbfgs")
-            names = m.model.exog_names
-            coef = m.params.get("Group_bin", 0.0) + m.params.get("Group_bin:C(Time)[T.Day84]", 0.0)
-            import numpy as _np
-            cvec = _np.zeros(len(names))
-            if "Group_bin" in names: cvec[names.index("Group_bin")] = 1.0
-            if "Group_bin:C(Time)[T.Day84]" in names: cvec[names.index("Group_bin:C(Time)[T.Day84]")] = 1.0
-            cov = m.cov_params().loc[names, names].values
-            se = float((_np.sqrt(cvec @ cov @ cvec.T)))
-            z = coef / se if se != 0 else np.nan
-            mmrm_p = float(2*(1-_norm.cdf(abs(z)))) if z==z else np.nan
-    except Exception as e:
-        st.warning(f"MMRM failed: {e}")
-
-final_model_df = pd.DataFrame([
-    {"Method":"ANCOVA Δ(final)", "p-value": anc_p},
-    {"Method":"MMRM Day-84 contrast", "p-value": mmrm_p},
-])
-st.dataframe(final_model_df)
-
-# --------------------- 8) MMRM Group×Weight ---------------------
-st.subheader("8) MMRM with Group×Weight — Day-84 effect vs weight")
-run_gxw = st.checkbox("Run Group×Weight model and plot Day-84 effect vs weight", value=False)
-gxw_df = pd.DataFrame()
-if run_gxw and ("Weight" in lr_f.columns) and not lr_f["Weight"].isna().all():
-    try:
-        import matplotlib.pyplot as plt
-        import statsmodels.formula.api as smf
-        from statsmodels.formula.api import mixedlm
-        lr = lr_f.dropna(subset=[endpoint_name,"Group","Time","Baseline","Weight"]).copy()
-        lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
-        lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
-        lr["Weight_c"]    = lr["Weight"] - lr["Weight"].mean()
-        m = mixedlm(f"{endpoint_name} ~ BL_centered + C(Time) + Group_bin + Weight_c + Group_bin:Weight_c + Group_bin:C(Time)",
-                    lr, groups=lr["Subject"], re_formula="1").fit(method="lbfgs")
-        names = m.model.exog_names; params = m.params[names]; cov = m.cov_params().loc[names, names].values
-        weights = np.linspace(lr["Weight"].min(), lr["Weight"].max(), 100)
-        rows = []
-        for w in weights:
-            wc = w - lr["Weight"].mean()
-            cvec = np.zeros(len(names))
-            if "Group_bin" in names: cvec[names.index("Group_bin")] = 1.0
-            k84 = "Group_bin:C(Time)[T.Day84]"
-            if k84 in names: cvec[names.index(k84)] = 1.0
-            if "Group_bin:Weight_c" in names: cvec[names.index("Group_bin:Weight_c")] = wc
-            diff = float(cvec @ params.values); se = float(np.sqrt(cvec @ cov @ cvec.T))
-            rows.append({"Weight": w, "Effect (USPlus−Placebo)": diff, "LCL": diff-1.96*se, "UCL": diff+1.96*se})
-        gxw_df = pd.DataFrame(rows)
-        fig, ax = plt.subplots(figsize=(7,4))
-        ax.plot(gxw_df["Weight"], gxw_df["Effect (USPlus−Placebo)"])
-        ax.fill_between(gxw_df["Weight"], gxw_df["LCL"], gxw_df["UCL"], alpha=0.3)
-        ax.axhline(0, linestyle="--")
-        ax.set_title(f"{endpoint_name}: Day-84 effect vs Weight (negative favors USPlus)")
-        ax.set_xlabel("Weight (kg)"); ax.set_ylabel("Effect (USPlus − Placebo)")
-        st.pyplot(fig)
-        st.dataframe(gxw_df.round(3))
-    except Exception as e:
-        st.warning(f"Group×Weight model could not be fit: {e}")
-else:
-    st.caption("Toggle the checkbox to run; requires Weight column in the sheet.")
-
-# --------------------- 9) Maximally-selected weight cut ---------------------
-st.subheader("9) Maximally-selected weight threshold (ANCOVA on ΔDay84)")
-run_cut = st.checkbox("Run threshold finder with permutation-adjusted p-value", value=False)
-perm_N = st.number_input("Permutations", value=200, min_value=50, max_value=2000, step=50)
-cut_low_pct  = st.slider("Search lower percentile of weight", 0, 40, 10)
-cut_high_pct = st.slider("Search upper percentile of weight", 60, 100, 90)
-cut_results = {}; cut_table = pd.DataFrame()
-
-if run_cut and not inp_f.empty and "Weight" in inp_f.columns:
-    import statsmodels.formula.api as smf
-    w = inp_f["Weight"].dropna().to_numpy()
-    if w.size >= 10 and "Day84" in inp_f.columns:
-        lo = np.percentile(w, cut_low_pct); hi = np.percentile(w, cut_high_pct)
-        candidates = np.unique(np.round(np.linspace(lo, hi, 25), 2))
-        rows = []
-        for t in candidates:
-            sub = inp_f[(inp_f["Weight"] < t) & inp_f["Day84"].notna()].copy()
-            if sub["Group"].nunique() < 2 or sub.shape[0] < 10:
-                rows.append({"Cut_kg": t, "N": sub.shape[0], "p_value": np.nan}); continue
-            sub["chg"] = sub["Day84"] - sub["Baseline"]
-            sub["Group_bin"] = (sub["Group"].astype(str).str.strip() != "Placebo").astype(int)
-            m = smf.ols("chg ~ Group_bin + Baseline", data=sub).fit(cov_type="HC3")
-            p = float(m.pvalues.get("Group_bin", np.nan))
-            rows.append({"Cut_kg": t, "N": sub.shape[0], "p_value": p})
-        cut_table = pd.DataFrame(rows).dropna(subset=["p_value"])
-        if cut_table.empty:
-            st.warning("No valid candidate cuts (insufficient data in subsets).")
-        else:
-            obs_min_p = cut_table["p_value"].min()
-            best_cut = float(cut_table.loc[cut_table["p_value"].idxmin(), "Cut_kg"])
-            st.write("Observed best cut:", best_cut, "kg; min p:", obs_min_p)
-            use = inp_f[["Subject","Group","Baseline","Day84","Weight"]].dropna().copy()
-            use["Group_bin"] = (use["Group"].astype(str).str.strip() != "Placebo").astype(int)
-            rng = np.random.default_rng(42)
-            perm_min_ps = []
-            for i in range(int(perm_N)):
-                shuffled = use.copy()
-                shuffled["Group_bin"] = rng.permutation(shuffled["Group_bin"].values)
-                min_p_i = 1.0
-                for t in candidates:
-                    sub = shuffled[(shuffled["Weight"] < t)].copy()
-                    if sub.shape[0] < 10 or sub["Group_bin"].nunique()<2: continue
-                    sub["chg"] = sub["Day84"] - sub["Baseline"]
-                    m = smf.ols("chg ~ Group_bin + Baseline", data=sub).fit()
-                    p = m.pvalues.get("Group_bin", np.nan)
-                    if pd.notna(p) and p < min_p_i: min_p_i = p
-                perm_min_ps.append(min_p_i)
-            perm_min_ps = np.array(perm_min_ps)
-            adj_p = float((perm_min_ps <= obs_min_p).mean())
-            cut_results = {"Best_cut_kg": best_cut, "Observed_min_p": obs_min_p, "Adjusted_p": adj_p}
-            st.write(f"Permutation-adjusted p-value: **{adj_p:.4f}**")
-            st.dataframe(cut_table.sort_values("p_value"))
-    else:
-        st.info("Not enough weight data (need ≥10 subjects with weight).")
-else:
-    st.caption("Toggle the checkbox to run; requires Weight and Day84.")
-
-# --------------------- 10) Responders ---------------------
-st.subheader("10) Responders at final visit (custom rules)")
-cR1, cR2, cR3 = st.columns(3)
-with cR1: thr_points = st.number_input("Absolute improvement ≥ (points)", value=5, step=1)
-with cR2: thr_pct = st.number_input("Percent improvement ≥ (%)", value=25, step=5) / 100.0
-with cR3: dir_lower_better = st.selectbox("Direction (lower score = better?)", ["Yes","No"], index=0) == "Yes"
-
-from scipy.stats import fisher_exact
-resp_rows = []
-if not inp_f.empty and "Day84" in inp_f.columns:
-    use = inp_f[["Subject","Group","Baseline","Day84"]].dropna().copy()
-    if use["Group"].nunique() >= 2:
-        if dir_lower_better:
-            use["chg"] = use["Day84"] - use["Baseline"]   # negative is improvement
-            abs_resp = (use["chg"] <= -thr_points).astype(int)
-            pct_resp = (safe_pct_improve(use["Baseline"], use["Day84"]) >= thr_pct).astype(int)
-        else:
-            use["chg"] = use["Day84"] - use["Baseline"]   # positive is improvement
-            abs_resp = (use["chg"] >= thr_points).astype(int)
-            pct_resp = (((use["Day84"] - use["Baseline"]) / use["Baseline"]) >= thr_pct).astype(int)
-        for label, resp in [(f"≥{thr_points} points", abs_resp),
-                            (f"≥{int(thr_pct*100)}%", pct_resp)]:
-            tab = pd.crosstab((use["Group"].astype(str).str.strip()!="Placebo"), resp)
-            if tab.shape == (2,2):
-                OR, p = fisher_exact(tab.values, alternative="greater")  # USPlus better
-                resp_rows.append({"Endpoint":label, "Odds Ratio":float(OR), "p-value (1-sided)":float(p)})
-            else:
-                resp_rows.append({"Endpoint":label, "Odds Ratio":np.nan, "p-value (1-sided)":np.nan})
-resp_df = pd.DataFrame(resp_rows)
-st.dataframe(resp_df)
-
-# --------------------- 11) Chart (optional) ---------------------
-st.subheader("11) Chart (median Δ with IQR) for selected pair")
-if gA and gB and not lc_f.empty:
-    import matplotlib.pyplot as plt
-    dfp = lc_f.copy()
-    fig, ax = plt.subplots()
-    for grp in [gA, gB]:
-        med = []; lo=[]; hi=[]
-        for v in VISIT_KEYS:
-            x = dfp[(dfp["Group"]==grp) & (dfp["Time"]==v)]["Change"].dropna().to_numpy()
-            if x.size == 0:
-                med.append(np.nan); lo.append(np.nan); hi.append(np.nan)
-            else:
-                m = np.median(x); q1 = np.percentile(x,25); q3 = np.percentile(x,75)
-                med.append(m); lo.append(m-(m-q1)); hi.append(m+(q3-m))
-        xs = np.arange(len(VISIT_KEYS))
-        ax.plot(xs, med, marker="o", label=f"{grp} (median Δ)")
-        ax.fill_between(xs, lo, hi, alpha=0.3)
-    ax.set_xticks(np.arange(len(VISIT_KEYS)), VISIT_KEYS)
-    ax.set_xlabel("Visit"); ax.set_ylabel("Change from Baseline")
-    ax.set_title(f"{endpoint_name}: Median Change with IQR — {gA} vs {gB}")
-    ax.legend(); st.pyplot(fig)
-else:
-    st.info("Select two groups and ensure data exists for chart.")
-
-# --------------------- 12) Download Excel ---------------------
-st.subheader("12) Download full results workbook")
-out = io.BytesIO()
-with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-    inp_f.to_excel(writer, sheet_name="INPUT_FILTERED", index=False)
-    lc_f.to_excel(writer, sheet_name="CHANGE_LONG", index=False)
-    if not lr_f.empty: lr_f.to_excel(writer, sheet_name="RAW_LONG", index=False)
-    rm_df.to_excel(writer, sheet_name="RM_NONPARAM", index=False)
-    pair_df.to_excel(writer, sheet_name="PAIRWISE", index=False)
-    within_df.to_excel(writer, sheet_name="WITHIN_GROUP", index=False)
-    final_model_df.to_excel(writer, sheet_name="FINAL_MODELS", index=False)
-    if not gxw_df.empty: gxw_df.to_excel(writer, sheet_name="MMRM_GxW_EffectVsWeight", index=False)
-    if isinstance(cut_results, dict) and cut_results:
-        pd.DataFrame([cut_results]).to_excel(writer, sheet_name="CUT_RESULT", index=False)
-    if not resp_df.empty: resp_df.to_excel(writer, sheet_name="RESPONDERS", index=False)
-out.seek(0)
-base = uploaded.name.rsplit(".",1)[0]
-st.download_button(
-    "⬇️ Download results Excel",
-    data=out,
-    file_name=f"{base}_{endpoint_name}_FULL_RESULTS.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
