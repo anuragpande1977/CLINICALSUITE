@@ -8,12 +8,13 @@ Includes:
   • **Van Elteren** pooled test on Δ across visits (stratified Wilcoxon)
   • **ANCOVA** at final timepoint: Final ~ Group + Baseline (HC3 SEs) with adjusted
     group difference and 95% CI
+  • Optional charts (box plots & median±IQR trends) on-screen **and embedded in Excel**
 
-Within-group analyses are removed by request.
+Within-group analyses are removed by request. The app is tolerant to GROUP spelling variations.
 
-Deploy notes (Streamlit Cloud):
+Deploy notes (Streamlit Cloud)
 - Python >=3.9
-- requirements.txt:
+- requirements.txt
   streamlit
   pandas
   scipy>=1.9
@@ -23,14 +24,12 @@ Deploy notes (Streamlit Cloud):
   matplotlib
   statsmodels
 
-Expected columns (case-sensitive):
-- 'SUBJECT ID'
-- 'GROUP'  (must contain exactly two arms: 'Placebo' and 'USPlus')
-- Four timepoint columns for the same IPSS scale, e.g.:
-  'Baseline IPSS  Total Score', 'Day 28 IPSS  Total Score',
-  'Day 56 IPSS  Total Score', 'Day 84 IPSS  Total Score'
-
-The app auto-detects the four timepoints via regex and sorts them chronologically.
+Expected columns in Excel (case-sensitive):
+- SUBJECT ID
+- GROUP  (aim for exactly two arms: 'Placebo' and 'USPlus'; aliases handled)
+- Four timepoint columns for the *same* IPSS scale, e.g.
+  Baseline IPSS  Total Score, Day 28 IPSS  Total Score,
+  Day 56 IPSS  Total Score, Day 84 IPSS  Total Score
 """
 
 import io
@@ -41,13 +40,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
-import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import streamlit as st
 
 st.set_page_config(page_title="IPSS — Placebo vs USPlus", layout="wide")
-st.title("IPSS (4 Time Points) — Placebo vs USPlus")
-st.caption("Between-group only: final values, Δ from baseline, Δ-by-visit, Van Elteren (pooled Δ), and ANCOVA (Final ~ Group + Baseline).")
+st.title("IPSS (4 Time Points) — Placebo vs USPlus (Between-Group Only)")
+st.caption("Final values, Δ from baseline, Δ-by-visit, Van Elteren pooled Δ, and ANCOVA (Final ~ Group + Baseline). Charts also exported to Excel.")
 
 # -------------------------------
 # Utilities
@@ -79,9 +77,18 @@ def validate_template(df: pd.DataFrame) -> Tuple[bool, str, List[str]]:
 
 
 def normalize_groups(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip().str.lower()
-    out = np.where(s == "placebo", "Placebo", np.where(s == "usplus", "USPlus", np.nan))
-    return pd.Series(out, index=series.index)
+    """Map GROUP labels to 'Placebo' or 'USPlus'. Tolerant to case, spaces, punctuation, and legacy 'Active'."""
+    s = series.astype(str).str.strip().str.lower().str.replace(r"[^a-z0-9]+", "", regex=True)
+    mapping = {
+        "placebo": "Placebo",
+        "control": "Placebo",
+        "usplus": "USPlus",
+        "us": "USPlus",
+        "active": "USPlus",
+    }
+    out = s.map(mapping)
+    out.name = "GROUP_NORM"
+    return out
 
 
 # -------------------------------
@@ -98,7 +105,6 @@ def _wilcoxon_stratum_stats(active: np.ndarray, placebo: np.ndarray) -> Tuple[fl
     ranks = stats.rankdata(pooled, method="average")
     W = ranks[:n1].sum()  # rank sum for Active (USPlus)
     E = n1 * (N + 1) / 2.0
-    # tie correction
     vals, counts = np.unique(pooled, return_counts=True)
     tie_term = ((counts ** 3 - counts).sum()) / (N * (N - 1)) if N > 1 else 0.0
     Var = (n1 * n2 / 12.0) * ((N + 1) - tie_term)
@@ -129,9 +135,12 @@ def analyze_between_groups(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, 
     """Between-group analyses only (Placebo vs USPlus)."""
     work = df.copy()
     work["GROUP_NORM"] = normalize_groups(work["GROUP"])  # Placebo / USPlus / NaN
-    # keep only the two arms of interest
-    filt = work["GROUP_NORM"].isin(["Placebo", "USPlus"]) 
-    work = work.loc[filt].copy()
+
+    # Warn & drop unrecognized labels
+    bad = work.loc[work["GROUP_NORM"].isna(), "GROUP"].dropna().astype(str).unique()
+    if len(bad):
+        st.warning(f"Dropped rows with unrecognized GROUP labels: {', '.join(sorted(bad))[:300]}")
+    work = work.loc[work["GROUP_NORM"].isin(["Placebo", "USPlus"])].copy()
 
     # counts sanity check
     group_counts = work["GROUP_NORM"].value_counts().to_frame(name="N").rename_axis("Group").reset_index()
@@ -141,46 +150,13 @@ def analyze_between_groups(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, 
 
     # Final values at final timepoint
     end_rows = []
-    for col in [final]:
-        plc = work.loc[work["GROUP_NORM"] == "Placebo", col].dropna()
-        usp = work.loc[work["GROUP_NORM"] == "USPlus",  col].dropna()
-        n_p, n_u = len(plc), len(usp)
-        note = None
-        if n_p >= 2 and n_u >= 2:
-            # Welch t
-            try:
-                _, p_t = stats.ttest_ind(plc, usp, equal_var=False, nan_policy='omit')
-            except Exception:
-                p_t = np.nan
-            # Mann–Whitney U
-            try:
-                _, p_u = stats.mannwhitneyu(plc, usp, alternative='two-sided')
-            except Exception:
-                p_u = np.nan
-            # Brunner–Munzel
-            try:
-                _, p_bm = stats.brunnermunzel(plc, usp, alternative='two-sided')
-            except Exception:
-                p_bm = np.nan
-        else:
-            p_t = p_u = p_bm = np.nan
-            note = "Insufficient N"
-        end_rows.append([col, n_p, n_u, "Welch t-test (indep)", p_t, note])
-        end_rows.append([col, n_p, n_u, "Mann–Whitney U", p_u, note])
-        end_rows.append([col, n_p, n_u, "Brunner–Munzel", p_bm, note])
-    end_final_df = pd.DataFrame(end_rows, columns=["Time", "N Placebo", "N USPlus", "Test", "p-value", "Note"])
-
-    # Δ from Baseline to final
-    end_delta_rows = []
-    d = work[["GROUP_NORM", base, final]].dropna()
-    d["DELTA"] = d[final] - d[base]
-    plc = d.loc[d["GROUP_NORM"] == "Placebo", "DELTA"].to_numpy()
-    usp = d.loc[d["GROUP_NORM"] == "USPlus",  "DELTA"].to_numpy()
-    n_p, n_u = plc.size, usp.size
+    plc = work.loc[work["GROUP_NORM"] == "Placebo", final].dropna()
+    usp = work.loc[work["GROUP_NORM"] == "USPlus",  final].dropna()
+    n_p, n_u = len(plc), len(usp)
     note = None
     if n_p >= 2 and n_u >= 2:
         try:
-            _, p_t = stats.ttest_ind(plc, usp, equal_var=False)
+            _, p_t = stats.ttest_ind(plc, usp, equal_var=False, nan_policy='omit')
         except Exception:
             p_t = np.nan
         try:
@@ -194,9 +170,37 @@ def analyze_between_groups(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, 
     else:
         p_t = p_u = p_bm = np.nan
         note = "Insufficient N"
-    end_delta_df = pd.DataFrame([[f"{base} → {final}", n_p, n_u, "Welch t-test (indep)", p_t, note],
-                                 [f"{base} → {final}", n_p, n_u, "Mann–Whitney U", p_u, note],
-                                 [f"{base} → {final}", n_p, n_u, "Brunner–Munzel", p_bm, note]],
+    end_final_df = pd.DataFrame([[final, n_p, n_u, "Welch t-test (indep)", p_t, note],
+                                 [final, n_p, n_u, "Mann–Whitney U", p_u, note],
+                                 [final, n_p, n_u, "Brunner–Munzel", p_bm, note]],
+                                columns=["Time", "N Placebo", "N USPlus", "Test", "p-value", "Note"])    
+
+    # Δ from Baseline to final
+    d = work[["GROUP_NORM", base, final]].dropna()
+    d["DELTA"] = d[final] - d[base]
+    plc_d = d.loc[d["GROUP_NORM"] == "Placebo", "DELTA"].to_numpy()
+    usp_d = d.loc[d["GROUP_NORM"] == "USPlus",  "DELTA"].to_numpy()
+    n_p2, n_u2 = plc_d.size, usp_d.size
+    note2 = None
+    if n_p2 >= 2 and n_u2 >= 2:
+        try:
+            _, p_t2 = stats.ttest_ind(plc_d, usp_d, equal_var=False)
+        except Exception:
+            p_t2 = np.nan
+        try:
+            _, p_u2 = stats.mannwhitneyu(plc_d, usp_d, alternative='two-sided')
+        except Exception:
+            p_u2 = np.nan
+        try:
+            _, p_bm2 = stats.brunnermunzel(plc_d, usp_d, alternative='two-sided')
+        except Exception:
+            p_bm2 = np.nan
+    else:
+        p_t2 = p_u2 = p_bm2 = np.nan
+        note2 = "Insufficient N"
+    end_delta_df = pd.DataFrame([[f"{base} → {final}", n_p2, n_u2, "Welch t-test (indep)", p_t2, note2],
+                                 [f"{base} → {final}", n_p2, n_u2, "Mann–Whitney U", p_u2, note2],
+                                 [f"{base} → {final}", n_p2, n_u2, "Brunner–Munzel", p_bm2, note2]],
                                 columns=["Change (Δ)", "N Placebo", "N USPlus", "Test", "p-value", "Note"])    
 
     # ---------- Δ-by-visit (each post-baseline) ----------
@@ -204,24 +208,23 @@ def analyze_between_groups(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, 
     usplus_by_visit: Dict[str, np.ndarray] = {}
     placebo_by_visit: Dict[str, np.ndarray] = {}
     for col in ipss_cols[1:]:
-        d = work[["GROUP_NORM", base, col]].dropna()
-        d["DELTA"] = d[col] - d[base]
-        plc = d.loc[d["GROUP_NORM"] == "Placebo", "DELTA"].to_numpy()
-        usp = d.loc[d["GROUP_NORM"] == "USPlus",  "DELTA"].to_numpy()
-        usplus_by_visit[col] = usp
-        placebo_by_visit[col] = plc
-        if plc.size >= 2 and usp.size >= 2:
+        d1 = work[["GROUP_NORM", base, col]].dropna()
+        d1["DELTA"] = d1[col] - d1[base]
+        plc_v = d1.loc[d1["GROUP_NORM"] == "Placebo", "DELTA"].to_numpy()
+        usp_v = d1.loc[d1["GROUP_NORM"] == "USPlus",  "DELTA"].to_numpy()
+        usplus_by_visit[col] = usp_v
+        placebo_by_visit[col] = plc_v
+        if plc_v.size >= 2 and usp_v.size >= 2:
             try:
-                _, p_t = stats.ttest_ind(plc, usp, equal_var=False)
+                _, p_t = stats.ttest_ind(plc_v, usp_v, equal_var=False)
             except Exception:
                 p_t = np.nan
             try:
-                _, p_u = stats.mannwhitneyu(plc, usp, alternative='two-sided')
+                _, p_u = stats.mannwhitneyu(plc_v, usp_v, alternative='two-sided')
             except Exception:
                 p_u = np.nan
             try:
-                _, p_bm = stats.brunnermunzel(plc, usp, alternative='two-sided')
-                
+                _, p_bm = stats.brunnermunzel(plc_v, usp_v, alternative='two-sided')
             except Exception:
                 p_bm = np.nan
             delta_rows.extend([[f"{base} → {col}", "Welch t-test (indep)", p_t],
@@ -238,7 +241,7 @@ def analyze_between_groups(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, 
     anc_rows = []
     dd = work[["GROUP_NORM", base, final]].dropna().rename(columns={base: "Baseline", final: "Final", "GROUP_NORM": "Group"})
     # ensure both groups present
-    if set(dd["Group"].unique()) == {"Placebo", "USPlus"} and len(dd) >= 10:
+    if set(dd["Group"].unique()) == {"Placebo", "USPlus"} and len(dd) >= 6:
         model = smf.ols("Final ~ Baseline + C(Group)", data=dd).fit(cov_type="HC3")
         term = "C(Group)[T.USPlus]"
         est = float(model.params.get(term, np.nan))
@@ -263,7 +266,59 @@ def analyze_between_groups(df: pd.DataFrame, ipss_cols: List[str]) -> Dict[str, 
     }
 
 
-def to_excel_with_results(original_df: pd.DataFrame, tables: Dict[str, pd.DataFrame]) -> bytes:
+# -------------------------------
+# Charts (on-screen and for Excel)
+# -------------------------------
+
+def _fig_to_buffer(fig) -> io.BytesIO:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def draw_boxplots(df: pd.DataFrame, ipss_cols: List[str]) -> List[Tuple[str, io.BytesIO]]:
+    df = df.copy(); df["GROUP_NORM"] = normalize_groups(df["GROUP"])  
+    figs = []
+    for col in ipss_cols:
+        pl = df.loc[df["GROUP_NORM"] == "Placebo", col].dropna()
+        us = df.loc[df["GROUP_NORM"] == "USPlus",  col].dropna()
+        if len(pl) == 0 and len(us) == 0:
+            continue
+        fig, ax = plt.subplots()
+        ax.boxplot([pl.values, us.values], labels=["Placebo", "USPlus"])
+        ax.set_title(f"{col} — Box plot by group")
+        ax.set_ylabel("IPSS Score")
+        st.pyplot(fig, use_container_width=True)
+        figs.append((f"Box: {col}", _fig_to_buffer(fig)))
+    return figs
+
+
+def draw_trend_median_iqr(df: pd.DataFrame, ipss_cols: List[str]) -> List[Tuple[str, io.BytesIO]]:
+    df = df.copy(); df["GROUP_NORM"] = normalize_groups(df["GROUP"])  
+    figs = []
+    for g in ("Placebo", "USPlus"):
+        med = []; q1 = []; q3 = []
+        for col in ipss_cols:
+            vals = df.loc[df["GROUP_NORM"] == g, col].dropna().values
+            if vals.size:
+                med.append(np.median(vals)); q1.append(np.percentile(vals, 25)); q3.append(np.percentile(vals, 75))
+            else:
+                med.append(np.nan); q1.append(np.nan); q3.append(np.nan)
+        fig, ax = plt.subplots()
+        x = np.arange(len(ipss_cols))
+        ax.plot(x, med, marker='o')
+        ax.fill_between(x, q1, q3, alpha=0.2)
+        ax.set_xticks(x); ax.set_xticklabels(ipss_cols, rotation=20)
+        ax.set_title(f"{g}: Median trend with IQR")
+        ax.set_ylabel("IPSS Score")
+        st.pyplot(fig, use_container_width=True)
+        figs.append((f"Trend Median+IQR: {g}", _fig_to_buffer(fig)))
+    return figs
+
+
+def to_excel_with_results(original_df: pd.DataFrame, tables: Dict[str, pd.DataFrame], charts: List[Tuple[str, io.BytesIO]]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         original_df.to_excel(writer, index=False, sheet_name="Input")
@@ -287,6 +342,15 @@ def to_excel_with_results(original_df: pd.DataFrame, tables: Dict[str, pd.DataFr
             else:
                 pd.DataFrame({"info": ["No results"]}).to_excel(writer, index=False, sheet_name=sheet, startrow=start)
                 start += 3
+
+        # CHARTS sheet: embed PNGs
+        wb = writer.book
+        ws = wb.add_worksheet("CHARTS")
+        r = 0
+        for title, img_buf in charts:
+            ws.write(r, 0, title)
+            ws.insert_image(r + 1, 0, "chart.png", {"image_data": img_buf, "x_scale": 0.9, "y_scale": 0.9})
+            r += 30
     return output.getvalue()
 
 
@@ -296,7 +360,7 @@ def to_excel_with_results(original_df: pd.DataFrame, tables: Dict[str, pd.DataFr
 with st.sidebar:
     st.header("Upload Excel")
     uploaded = st.file_uploader("Excel file (.xlsx)", type=["xlsx"])    
-    st.markdown("This app filters to **Placebo** and **USPlus** arms only.")
+    st.markdown("This app filters to **Placebo** and **USPlus** arms only. Labels like 'US Plus' or 'Active' are auto-mapped.")
 
 if uploaded is None:
     st.info("Upload an Excel to begin.")
@@ -318,7 +382,9 @@ if not ok:
 st.subheader("Detected Time Points")
 st.write(ipss_cols)
 
-# Compute
+with st.expander("Preview first 10 rows"):
+    st.dataframe(df.head(10), use_container_width=True)
+
 with st.spinner("Running between-group analyses (Placebo vs USPlus)..."):
     tables = analyze_between_groups(df, ipss_cols)
 
@@ -329,7 +395,7 @@ st.dataframe(tables["END_FINAL"], use_container_width=True)
 st.dataframe(tables["END_DELTA"], use_container_width=True)
 
 st.subheader("ANCOVA (Final ~ Group + Baseline)")
-st.caption("Adjusted group difference (USPlus − Placebo) with HC3 SE and 95% CI.")
+st.caption("Adjusted difference (USPlus − Placebo) with HC3 SE and 95% CI.")
 st.dataframe(tables["ANCOVA_FINAL"], use_container_width=True)
 
 st.subheader("Δ-by-visit — between-group tests")
@@ -340,10 +406,16 @@ st.dataframe(tables["VAN_ELTEREN_DELTA"], use_container_width=True)
 with st.expander("Stratum sizes used in Van Elteren"):
     st.dataframe(tables["VAN_ELTEREN_STRATA_COUNTS"], use_container_width=True)
 
+# Charts on screen + collect for Excel
+st.subheader("Charts ▸ Box plots & Median±IQR trends")
+chart_buffers: List[Tuple[str, io.BytesIO]] = []
+chart_buffers += draw_boxplots(df, ipss_cols)
+chart_buffers += draw_trend_median_iqr(df, ipss_cols)
+
 # Download
-excel_bytes = to_excel_with_results(df, tables)
+excel_bytes = to_excel_with_results(df, tables, chart_buffers)
 st.download_button(
-    label="Download RESULTS workbook",
+    label="Download RESULTS workbook (with CHARTS)",
     data=excel_bytes,
     file_name="ipss_between_only_output.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
