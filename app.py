@@ -4,6 +4,15 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# ---- Hard dependency guard for Excel (.xlsx) ----
+try:
+    import openpyxl  # noqa: F401
+except Exception as e:
+    st.error("This app requires the 'openpyxl' package to read .xlsx files.\n"
+             "Add 'openpyxl' to requirements.txt at the repo root and redeploy.\n\n"
+             f"Import error: {e}")
+    st.stop()
+
 from scipy.stats import mannwhitneyu, brunnermunzel, ttest_rel, ttest_ind, wilcoxon, fisher_exact, norm
 import statsmodels.formula.api as smf
 from statsmodels.formula.api import ols
@@ -16,13 +25,12 @@ st.title("Clinical Analysis Suite v2 — Multi-Endpoint • Analysis-Sets • Cu
 st.caption(
     "Map your columns (Subject, Group, optional Status/Age/Weight/BMI, Baseline, Day28/56/84). "
     "Choose analysis sets (ITT/PP/Completers/filters), responder rules, and run model-based and nonparam tests. "
-    "New in v2: **MMRM Group×Weight** final-visit effects + **maximally-selected weight cut** with permutation-adjusted p."
+    "Includes: **MMRM Group×Weight** (final-visit effect vs weight) and **maximally-selected weight cut** (permutation-adjusted)."
 )
 
 DEFAULT_VISITS = ["Day 28", "Day 56", "Day 84"]
 VISIT_KEYS     = ["Day28", "Day56", "Day84"]  # internal keys
 
-# ---------- Helpers ----------
 def norm(s): return str(s).strip().lower()
 def try_numeric(series): return pd.to_numeric(series, errors="coerce")
 def ensure_cat_time(df, order): df["Time"] = pd.Categorical(df["Time"], categories=order, ordered=True); return df
@@ -35,27 +43,26 @@ def safe_pct_improve(baseline, final):
     out[mask] = (baseline[mask] - final[mask]) / baseline[mask]
     return out
 
-def cliffs_delta(a, b):
-    a, b = np.asarray(a), np.asarray(b); m, n = len(a), len(b)
-    if m == 0 or n == 0: return np.nan
-    wins = 0
-    for x in a: wins += np.sum(x > b) - np.sum(x < b)
-    return wins / (m * n)
-
-def hodges_lehmann(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    if len(a) == 0 or len(b) == 0: return np.nan
-    diffs = a.reshape(-1,1) - b.reshape(1,-1)
-    return float(np.median(diffs))
-
 # ---------- Upload ----------
 st.subheader("1) Upload Excel")
 uploaded = st.file_uploader("Upload a workbook with a single endpoint table (Baseline, Day28/56/84).", type=["xlsx"])
 if not uploaded: st.stop()
 
+# Use BytesIO for safety on Streamlit Cloud
+file_bytes = uploaded.read()
+bio = io.BytesIO(file_bytes)
+
 # Sheet and preview
-xl = pd.ExcelFile(uploaded, engine='openpyxl'); sheet_name = st.selectbox("Select sheet", xl.sheet_names, index=0)
-raw = pd.read_excel(uploaded, sheet_name=sheet_name)
+try:
+    xl = pd.ExcelFile(bio, engine="openpyxl")
+    sheet_name = st.selectbox("Select sheet", xl.sheet_names, index=0)
+    raw = pd.read_excel(bio, sheet_name=sheet_name, engine="openpyxl")
+except Exception as e:
+    st.error("Failed to read the uploaded .xlsx file with openpyxl. "
+             "Please confirm the file is a valid Excel workbook. "
+             f"Details: {e}")
+    st.stop()
+
 st.write("Preview:", raw.head())
 
 # ---------- Column mapping ----------
@@ -91,19 +98,19 @@ if opt_bmi    != "<none>": inp["BMI"]    = try_numeric(raw[opt_bmi])
 # Long change + raw
 rows = []
 for _, r in inp.iterrows():
-    for v in VISIT_KEYS:
+    for v in ["Day28","Day56","Day84"]:
         if pd.notna(r[v]):
             rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(r[v]-r["Baseline"])})
-long_change = ensure_cat_time(pd.DataFrame(rows), VISIT_KEYS) if len(rows)>0 else pd.DataFrame()
+long_change = ensure_cat_time(pd.DataFrame(rows), ["Day28","Day56","Day84"]) if len(rows)>0 else pd.DataFrame()
 
 rows_raw = []
 for _, r in inp.iterrows():
-    for v in VISIT_KEYS:
+    for v in ["Day28","Day56","Day84"]:
         if pd.notna(r[v]):
             rows_raw.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v,
                              endpoint_name: float(r[v]), "Baseline": float(r["Baseline"]),
                              "Weight": r.get("Weight", np.nan)})
-long_raw = ensure_cat_time(pd.DataFrame(rows_raw), VISIT_KEYS) if len(rows_raw)>0 else pd.DataFrame()
+long_raw = ensure_cat_time(pd.DataFrame(rows_raw), ["Day28","Day56","Day84"]) if len(rows_raw)>0 else pd.DataFrame()
 
 # ---------- Analysis sets & filters ----------
 st.subheader("3) Analysis sets & filters")
@@ -146,16 +153,17 @@ keep_ids = set(inp["Subject"][keep])
 inp_f = inp[inp["Subject"].isin(keep_ids)].copy()
 lc_f  = long_change[long_change["Subject"].isin(keep_ids)].copy()
 lr_f  = long_raw[long_raw["Subject"].isin(keep_ids)].copy()
+
 st.write(f"Kept N subjects: {len(keep_ids)}")
 
-# ---------- Nonparam RM across groups ----------
+# ---------- RM (rank ANOVA) ----------
 st.subheader("4) Repeated measures (rank ANOVA on change)")
 if not lc_f.empty:
     lc = lc_f.copy(); lc["rank_change"] = lc["Change"].rank(method="average")
     model = ols("rank_change ~ C(Subject) + C(Group) * C(Time)", data=lc).fit()
     an = anova_lm(model, typ=3)
     rm_df = pd.DataFrame({
-        "Effect": ["Group (all groups)", f"Time ({', '.join(VISIT_KEYS)})", "Group × Time"],
+        "Effect": ["Group (all groups)", "Time (Day28, Day56, Day84)", "Group × Time"],
         "p-value": [float(an.loc["C(Group)","PR(>F)"]),
                     float(an.loc["C(Time)","PR(>F)"]),
                     float(an.loc["C(Group):C(Time)","PR(>F)"])]
@@ -164,12 +172,12 @@ else:
     rm_df = pd.DataFrame({"Effect":["Group (all groups)", "Time", "Group × Time"], "p-value":[np.nan,np.nan,np.nan]})
 st.dataframe(rm_df)
 
-# ---------- Pairwise per-visit tests ----------
+# ---------- Pairwise per visit ----------
 st.subheader("5) Pairwise tests per visit")
 pair_df = pd.DataFrame()
 if gA and gB and not lc_f.empty:
     rows = []
-    for v in VISIT_KEYS:
+    for v in ["Day28","Day56","Day84"]:
         a = lc_f[(lc_f["Group"]==gA) & (lc_f["Time"]==v)]["Change"].dropna()
         b = lc_f[(lc_f["Group"]==gB) & (lc_f["Time"]==v)]["Change"].dropna()
         if len(a)>0 and len(b)>0:
@@ -195,7 +203,7 @@ if not inp_f.empty:
     for grp in sorted(inp_f["Group"].unique().tolist()):
         g = inp_f[inp_f["Group"]==grp]
         base = g["Baseline"]
-        for v in VISIT_KEYS:
+        for v in ["Day28","Day56","Day84"]:
             fol = g[v]
             paired = pd.concat([base, fol], axis=1).dropna()
             if paired.shape[0]>0:
@@ -211,7 +219,7 @@ if not inp_f.empty:
 within_df = pd.DataFrame(within_rows)
 st.dataframe(within_df)
 
-# ---------- End-of-trial models ----------
+# ---------- End-of-trial (ANCOVA & MMRM) ----------
 st.subheader("7) End-of-trial (final visit) — model-based p-values")
 final_key = "Day84"
 anc_row = {"Method":"ANCOVA Δ(final)","p-value":np.nan}
@@ -240,16 +248,16 @@ if not lr_f.empty:
             se = float(np.sqrt(cvec @ cov @ cvec.T))
             z = coef / se if se != 0 else np.nan
             mmrm_row["p-value"] = float(2*(1-norm.cdf(abs(z)))) if z==z else np.nan
-        except Exception:
-            pass
+        except Exception as e:
+            st.warning(f"MMRM fit failed: {e}")
 final_model_df = pd.DataFrame([anc_row, mmrm_row])
 st.dataframe(final_model_df)
 
-# ---------- NEW: MMRM Group×Weight (final visit effect-vs-weight) ----------
+# ---------- MMRM Group×Weight ----------
 st.subheader("8) MMRM with Group×Weight — final visit effect vs weight")
 run_gxw = st.checkbox("Run Group×Weight model and plot Day-84 effect vs weight", value=False)
 gxw_df = pd.DataFrame()
-if run_gxw and "Weight" in lr_f.columns and not lr_f["Weight"].isna().all():
+if run_gxw and ("Weight" in lr_f.columns) and not lr_f["Weight"].isna().all():
     lr = lr_f.dropna(subset=[endpoint_name, "Group", "Time", "Baseline", "Weight"]).copy()
     lr["BL_centered"] = lr["Baseline"] - lr["Baseline"].mean()
     lr["Group_bin"]   = (lr["Group"].astype(str).str.strip() != "Placebo").astype(int)
@@ -262,16 +270,13 @@ if run_gxw and "Weight" in lr_f.columns and not lr_f["Weight"].isna().all():
         rows = []
         for w in weights:
             wc = w - lr["Weight"].mean()
-            # Build contrast at Day84: (Group + Group:Time[Day84]) + (Group:Weight_c * wc)
             cvec = np.zeros(len(names))
             if "Group_bin" in names: cvec[names.index("Group_bin")] = 1.0
             key84 = "Group_bin:C(Time)[T.Day84]"
             if key84 in names: cvec[names.index(key84)] = 1.0
             if "Group_bin:Weight_c" in names: cvec[names.index("Group_bin:Weight_c")] = wc
-            diff = float(cvec @ params.values)
-            se   = float(np.sqrt(cvec @ cov @ cvec.T))
-            lcl = diff - 1.96*se; ucl = diff + 1.96*se
-            rows.append({"Weight": w, "Effect (USPlus−Placebo)": diff, "LCL": lcl, "UCL": ucl})
+            diff = float(cvec @ params.values); se = float(np.sqrt(cvec @ cov @ cvec.T))
+            rows.append({"Weight": w, "Effect (USPlus−Placebo)": diff, "LCL": diff-1.96*se, "UCL": diff+1.96*se})
         gxw_df = pd.DataFrame(rows)
         fig, ax = plt.subplots(figsize=(7,4))
         ax.plot(gxw_df["Weight"], gxw_df["Effect (USPlus−Placebo)"])
@@ -279,31 +284,26 @@ if run_gxw and "Weight" in lr_f.columns and not lr_f["Weight"].isna().all():
         ax.axhline(0, linestyle="--")
         ax.set_title(f"{endpoint_name}: Day-84 effect vs Weight (negative favors USPlus)")
         ax.set_xlabel("Weight (kg)"); ax.set_ylabel("Effect (USPlus − Placebo)")
-        st.pyplot(fig)
-        st.dataframe(gxw_df.round(3))
-        st.info("If the blue band stays below 0 for a range, USPlus is significantly better in that weight band.")
+        st.pyplot(fig); st.dataframe(gxw_df.round(3))
     except Exception as e:
         st.warning(f"Group×Weight model could not be fit: {e}")
 else:
     st.caption("Toggle the checkbox to run; requires a Weight column.")
 
-# ---------- NEW: Maximally selected weight cut (permutation-adjusted) ----------
-st.subheader("9) Maximally-selected weight threshold (ANCOVA on ΔDay84)")
+# ---------- Maximally selected cut ----------
+st.subheader("9) Maximally-selected weight threshold (ΔDay84 ANCOVA)")
 run_cut = st.checkbox("Run threshold finder with permutation-adjusted p-value", value=False)
-perm_N = st.number_input("Permutations (higher = slower, more accurate)", value=200, min_value=50, max_value=2000, step=50)
+perm_N = st.number_input("Permutations", value=200, min_value=50, max_value=2000, step=50)
 cut_low_pct  = st.slider("Search lower percentile of weight", 0, 40, 10)
 cut_high_pct = st.slider("Search upper percentile of weight", 60, 100, 90)
+cut_results = {}; cut_table = pd.DataFrame()
 
-cut_results = {}
-cut_table = pd.DataFrame()
 if run_cut and not inp_f.empty and "Weight" in inp_f.columns:
-    # Build candidate cuts
     w = inp_f["Weight"].dropna().to_numpy()
     if w.size >= 10:
         lo = np.percentile(w, cut_low_pct); hi = np.percentile(w, cut_high_pct)
         candidates = np.unique(np.round(np.linspace(lo, hi, 25), 2))
         rows = []
-        # observed min-p across cuts
         for t in candidates:
             sub = inp_f[(inp_f["Weight"] < t) & inp_f["Day84"].notna()].copy()
             if sub["Group"].nunique() < 2 or sub.shape[0] < 10:
@@ -320,7 +320,6 @@ if run_cut and not inp_f.empty and "Weight" in inp_f.columns:
             obs_min_p = cut_table["p_value"].min()
             best_cut = float(cut_table.loc[cut_table["p_value"].idxmin(), "Cut_kg"])
             st.write("Observed best cut:", best_cut, "kg; min p:", obs_min_p)
-            # Permutation-adjusted p: shuffle group labels, recompute min p
             use = inp_f[["Subject","Group","Baseline","Day84","Weight"]].dropna().copy()
             use["Group_bin"] = (use["Group"].astype(str).str.strip() != "Placebo").astype(int)
             rng = np.random.default_rng(42)
@@ -335,16 +334,15 @@ if run_cut and not inp_f.empty and "Weight" in inp_f.columns:
                     sub["chg"] = sub["Day84"] - sub["Baseline"]
                     m = smf.ols("chg ~ Group_bin + Baseline", data=sub).fit()
                     p = m.pvalues.get("Group_bin", np.nan)
-                    if pd.notna(p):
-                        if p < min_p_i: min_p_i = p
+                    if pd.notna(p) and p < min_p_i: min_p_i = p
                 perm_min_ps.append(min_p_i)
             perm_min_ps = np.array(perm_min_ps)
             adj_p = float((perm_min_ps <= obs_min_p).mean())
-            st.write(f"Permutation-adjusted p-value for optimal cut: **{adj_p:.4f}**")
             cut_results = {"Best_cut_kg": best_cut, "Observed_min_p": obs_min_p, "Adjusted_p": adj_p}
+            st.write(f"Permutation-adjusted p-value: **{adj_p:.4f}**")
             st.dataframe(cut_table.sort_values("p_value"))
     else:
-        st.info("Not enough weight data to run threshold finder (need ≥10 subjects with weight).")
+        st.info("Not enough weight data (need ≥10 subjects with weight).")
 else:
     st.caption("Toggle the checkbox to run; requires Weight and Day84.")
 
@@ -392,8 +390,7 @@ with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
     if not gxw_df.empty: gxw_df.to_excel(writer, sheet_name="MMRM_GxW_EffectVsWeight", index=False)
     if isinstance(cut_results, dict) and cut_results:
         pd.DataFrame([cut_results]).to_excel(writer, sheet_name="CUT_RESULT", index=False)
-    if not cut_table.empty: cut_table.to_excel(writer, sheet_name="CUT_SCAN", index=False)
-    resp_df.to_excel(writer, sheet_name="RESPONDERS", index=False)
+    if not resp_df.empty: resp_df.to_excel(writer, sheet_name="RESPONDERS", index=False)
 out.seek(0)
 base = uploaded.name.rsplit(".",1)[0]
 st.download_button(
@@ -402,4 +399,3 @@ st.download_button(
     file_name=f"{base}_{endpoint_name}_RESULTS_v2.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
-
