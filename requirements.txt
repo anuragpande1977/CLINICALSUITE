@@ -1,6 +1,8 @@
 streamlit
 pandas
-scipy
+scipy>=1.9
+numpy
 openpyxl
 xlsxwriter
 matplotlib
+statsmodels
